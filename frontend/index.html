@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NextBridge Agentic HR Portal</title>
+    <!-- Marked.js for rendering Markdown output from the LLM -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root { --primary: #0052cc; --bg: #f4f5f7; --chat-bg: #ffffff; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); margin: 0; padding: 20px; display: flex; justify-content: center; }
+        .chat-container { width: 100%; max-width: 800px; background: var(--chat-bg); border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); display: flex; flex-direction: column; height: 90vh; }
+        /* .header { background: var(--primary); color: white; padding: 15px 20px; border-top-left-radius: 10px; border-top-right-radius: 10px; font-weight: bold; font-size: 1.1rem; } */
+        /* Header Flexbox Alignment */
+        .header { 
+            background: var(--primary); 
+            color: white; 
+            padding: 15px 20px; 
+            border-top-left-radius: 10px; 
+            border-top-right-radius: 10px; 
+            font-weight: bold; 
+            font-size: 1.1rem; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+        
+        /* Reset Button Styling */
+        .reset-btn {
+            background: rgba(255, 255, 255, 0.15);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: 0.2s ease;
+        }
+        .reset-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        .messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        .message { max-width: 85%; padding: 12px 16px; border-radius: 8px; line-height: 1.5; font-size: 0.95rem; position: relative; word-wrap: break-word; }
+        
+        /* Message styling */
+        .user { background: #e3f2fd; align-self: flex-end; color: #0d47a1; white-space: pre-wrap; }
+        .assistant { background: #f1f3f4; align-self: flex-start; color: #202124; }
+        .assistant p { margin: 0 0 10px 0; }
+        .assistant p:last-child { margin: 0; }
+        .assistant ul, .assistant ol { margin: 5px 0; padding-left: 20px; }
+        
+        /* UI Elements */
+        .tool-indicator { color: #5f6368; font-style: italic; font-size: 0.9rem; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 1; } 100% { opacity: 0.6; } }
+        .tts-btn { margin-top: 10px; background: #fff; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; padding: 4px 10px; font-size: 0.8rem; display: inline-flex; align-items: center; gap: 4px; transition: 0.2s; }
+        .tts-btn:hover { background: #eee; }
+        .input-area { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; outline: none; }
+        input[type="text"]:focus { border-color: var(--primary); }
+        button.send-btn { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        button.send-btn:hover { background: #003d99; }
+        button.send-btn:disabled { background: #ccc; cursor: not-allowed; }
+        
+        /* Approval Card */
+        .approval-card { background: #fff8e1; border: 1px solid #ffe082; padding: 15px; border-radius: 8px; margin-top: 15px; }
+        .approval-btns { display: flex; gap: 10px; margin-top: 10px; }
+        .btn-confirm { background: #2e7d32; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold;}
+        .btn-cancel { background: #c62828; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold;}
+    </style>
+</head>
+<body>
+
+<div class="chat-container">
+    <div class="header">
+        <span>NextBridge HR Agentic Workflow Assistant</span>
+        <button class="reset-btn" onclick="resetChat()">🔄 Reset Chat</button>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="input-area">
+        <input type="text" id="userInput" placeholder="Ask about HR policies, leaves, complaints, or meal subscriptions..." onkeydown="if(event.key==='Enter') sendMessage()" />
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
+    </div>
+</div>
+
+<script>
+    // Check if the browser already remembers a session ID from a previous visit
+    let threadId = localStorage.getItem('hr_agent_session');
+
+    if (!threadId) {
+        // If no session exists (brand new visit), generate a new one and save it permanently
+        threadId = "session_" + Math.random().toString(36).substring(7);
+        localStorage.setItem('hr_agent_session', threadId);
+    }    
+    const messagesDiv = document.getElementById('messages');
+    const inputField = document.getElementById('userInput');
+    const sendBtn = document.getElementById('sendBtn');
+
+    function toggleInput(disable) {
+        inputField.disabled = disable;
+        sendBtn.disabled = disable;
+        if (!disable) inputField.focus();
+    }
+
+    async function sendMessage() {
+        const text = inputField.value.trim();
+        if(!text) return;
+
+        appendMessage('user', text);
+        inputField.value = '';
+        toggleInput(true); // Disable input while agent processes
+
+        const assistantMsgDiv = appendMessage('assistant', '');
+        const textSpan = document.createElement('span');
+        assistantMsgDiv.appendChild(textSpan);
+        textSpan.innerHTML = `<span class="tool-indicator">Agent is thinking...</span>`;
+
+        try {
+            const response = await fetch('http://localhost:8000/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ thread_id: threadId, message: text })
+            });
+
+            await streamResponse(response, textSpan, assistantMsgDiv);
+        } catch (error) {
+            textSpan.innerHTML = "<span style='color:red;'>Error connecting to the agent. Ensure the server is running.</span>";
+        }
+        
+        toggleInput(false);
+    }
+
+    async function streamResponse(response, textSpan, containerDiv) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullResponse = "";
+        let isApprovalRequired = false;
+
+        while(true) {
+            const { done, value } = await reader.read();
+            if(done) break;
+            
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for(let line of lines) {
+                if(line.startsWith('data: ')) {
+                    const dataStr = line.replace('data: ', '').trim();
+                    if(dataStr === '[DONE]') break;
+                    
+                    try {
+                        const parsed = JSON.parse(dataStr);
+                        
+                        if(parsed.type === 'token') {
+                            fullResponse += parsed.content;
+                            textSpan.innerHTML = marked.parse(fullResponse);
+                        } else if(parsed.type === 'tool_start') {
+                            // Show tool execution indicator if no text has been generated yet
+                            if (!fullResponse) {
+                                textSpan.innerHTML = `<span class="tool-indicator">⚙️ Agent searching/executing: ${parsed.tool}...</span>`;
+                            }
+                        } else if(parsed.type === 'tool_end') {
+                            if(parsed.output.includes('DRAFT_GENERATED')) {
+                                renderApprovalCard(containerDiv, parsed.output);
+                                isApprovalRequired = true;
+                            }
+                        } else if(parsed.type === 'status') {
+                            if (!isApprovalRequired && !fullResponse) {
+                                textSpan.innerHTML = `<span class="tool-indicator">${parsed.content}</span>`;
+                            }
+                        }
+                    } catch(e) {
+                        console.warn("SSE Parse error:", e);
+                    }
+                }
+            }
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // Add TTS Button if there is text and no pending approval blocking the workflow
+        if (fullResponse.trim().length > 0) {
+            const ttsBtn = document.createElement('button');
+            ttsBtn.className = 'tts-btn';
+            ttsBtn.innerHTML = '🔊 Read Aloud';
+            // Use textSpan.innerText to strip HTML/Markdown tags for the speech synthesis
+            ttsBtn.onclick = () => speakText(textSpan.innerText); 
+            containerDiv.appendChild(document.createElement('br'));
+            containerDiv.appendChild(ttsBtn);
+        }
+    }
+
+    function appendMessage(sender, text) {
+        const div = document.createElement('div');
+        div.className = `message ${sender}`;
+        div.innerText = text; // user messages are plain text
+        messagesDiv.appendChild(div);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        return div;
+    }
+
+    function renderApprovalCard(container, draftText) {
+        const card = document.createElement('div');
+        card.className = 'approval-card';
+        card.innerHTML = `<strong>⚠️ Verification Required</strong><pre style="white-space: pre-wrap; font-family: inherit; font-size: 0.9rem;">${draftText}</pre>`;
+        
+        const btnGroup = document.createElement('div');
+        btnGroup.className = 'approval-btns';
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.className = 'btn-confirm';
+        confirmBtn.innerText = 'Approve & Send';
+        confirmBtn.onclick = () => handleApproval(true, card);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn-cancel';
+        cancelBtn.innerText = 'Cancel Request';
+        cancelBtn.onclick = () => handleApproval(false, card);
+
+        btnGroup.appendChild(confirmBtn);
+        btnGroup.appendChild(cancelBtn);
+        card.appendChild(btnGroup);
+        container.appendChild(card);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    async function handleApproval(approved, cardElement) {
+        cardElement.remove(); // Remove the action buttons so user can't click twice
+        appendMessage('user', approved ? "Approved. Please send the email." : "Cancel the email dispatch.");
+        toggleInput(true);
+
+        const assistantMsgDiv = appendMessage('assistant', '');
+        const textSpan = document.createElement('span');
+        assistantMsgDiv.appendChild(textSpan);
+        textSpan.innerHTML = `<span class="tool-indicator">Processing system response...</span>`;
+
+        try {
+            const response = await fetch('http://localhost:8000/api/approve-action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ thread_id: threadId, approved: approved })
+            });
+            
+            // Re-use the streaming function to read the confirmation response from the server
+            await streamResponse(response, textSpan, assistantMsgDiv);
+        } catch (error) {
+            textSpan.innerHTML = "<span style='color:red;'>Error executing action.</span>";
+        }
+
+        toggleInput(false);
+    }
+
+    function speakText(text) {
+        if ('speechSynthesis' in window) {
+            window.speechSynthesis.cancel(); // Stop any currently playing speech
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.0;
+            window.speechSynthesis.speak(utterance);
+        } else {
+            alert('Your browser does not support Text-to-Speech.');
+        }
+    }
+    function resetChat() {
+        const confirmReset = confirm("Are you sure you want to start a new chat? This will clear the agent's memory for this session.");
+        if (confirmReset) {
+            localStorage.removeItem('hr_agent_session');
+            location.reload(); // Reloads the page, generating a brand new threadId
+        }
+    }
+    // Background polling loop to check for unsolicited agent updates
+    setInterval(async () => {
+        // Do not poll if the chat session hasn't been initialized yet
+        if (typeof threadId === 'undefined' || !threadId) return;
+
+        try {
+            const response = await fetch(`http://localhost:8000/api/notifications/${threadId}`);
+            if (!response.ok) return;
+            
+            const data = await response.json();
+            
+            // If the queue has unread messages, render them instantly
+            if (data.notifications && data.notifications.length > 0) {
+                for (let msg of data.notifications) {
+                    
+                    // 1. Create a new chat bubble using the correct CSS class
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'message assistant';
+                    
+                    // 2. Parse Markdown and render text
+                    const textSpan = document.createElement('span');
+                    textSpan.innerHTML = typeof marked !== 'undefined' ? marked.parse(msg) : msg; 
+                    msgDiv.appendChild(textSpan);
+                    
+                    // 3. Add TTS Button
+                    const ttsBtn = document.createElement('button');
+                    ttsBtn.className = 'tts-btn';
+                    ttsBtn.innerHTML = '🔊 Read Aloud';
+                    ttsBtn.onclick = () => speakText(textSpan.innerText); 
+                    
+                    msgDiv.appendChild(document.createElement('br'));
+                    msgDiv.appendChild(ttsBtn);
+                    
+                    // 4. Append to the correct HTML element ('messagesDiv', not 'chat-box')
+                    messagesDiv.appendChild(msgDiv);
+                    
+                    // Auto-scroll to the new message
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+                    // Proactively alert the user with audio
+                    speakText("You have a new update from the HR department.");
+                }
+            }
+        } catch (e) {
+            // Fail silently if the network drops or server restarts
+            console.debug("Polling iteration skipped.", e);
+        }
+    }, 5000); // 5000 milliseconds = 5 seconds
+</script>
+</body>
+</html>

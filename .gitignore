@@ -1,0 +1,70 @@
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.local
+.env.*
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+env/
+ENV/
+.venv/
+
+# =========================
+# Python Built-ins
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# =========================
+# Local Databases & State
+# =========================
+# LangGraph checkpointer memory
+*.db
+*.sqlite
+*.sqlite3
+hr_agent_memory.db
+
+# =========================
+# Vector Database (ChromaDB)
+# =========================
+# Exclude the local embeddings directory
+data/
+chroma_db/
+vector_db/
+
+# =========================
+# Logs and Caches
+# =========================
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# OS Generated Files
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =========================
+# IDE & Editor Directories
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
