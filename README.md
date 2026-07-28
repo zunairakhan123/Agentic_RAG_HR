@@ -49,47 +49,48 @@ This project moves beyond linear, single-turn conversational chatbots by impleme
 
 ```
                         ┌─────────────────────┐
-                        │   Frontend (HTML/JS) │
-                        │  Short-polling + TTS  │
-                        └──────────┬───────────┘
+                        │   Frontend (HTML/JS)│
+                        │Short-polling+TTS+STT│
+                        └──────────┬──────────┘
                                    │ SSE / REST
                                    ▼
                         ┌─────────────────────┐
-                        │   FastAPI Backend    │
-                        │  (api.py)             │
-                        │  - SSE streaming       │
-                        │  - Webhook endpoint    │
-                        └──────────┬───────────┘
+                        │   FastAPI Backend   │
+                        │  (api.py)           │
+                        │  - SSE streaming    │
+                        │  - Webhook endpoint │
+                        └──────────┬──────────┘
                                    │
                     ┌──────────────┼──────────────┐
                     ▼                              ▼
           ┌───────────────────┐         ┌───────────────────┐
-          │   LangGraph Agent  │◄───────►│  SQLite Checkpoint │
-          │   (graph.py)        │         │  (thread memory)   │
-          │  - Guardrails        │         └───────────────────┘
-          │  - HITL freeze/resume│
-          └─────────┬──────────┘
+          │   LangGraph Agent │◄───────►│  SQLite Checkpoint│
+          │   (graph.py)      │         │  (thread memory)  │
+          │  - Guardrails     │         └───────────────────┘
+          │  - HITL freeze/   |
+          |    resume         │
+          └─────────┬─────────┘
                     │
         ┌───────────┼───────────┐
-        ▼                        ▼
-┌───────────────┐      ┌────────────────────┐
-│  ChromaDB RAG  │      │  Tools (tools.py)   │
-│  (ingestion.py)│      │  - Retrieval         │
-└───────────────┘      │  - Web search         │
-                        │  - Email dispatch      │
-                        └──────────┬─────────┘
+        ▼                       ▼
+┌───────────────┐       ┌───────────────────┐
+│  ChromaDB RAG │       │  Tools (tools.py) │
+│ (ingestion.py)│       │  - Retrieval      │
+└───────────────┘       │  - Web search     │
+                        │  - Email dispatch │
+                        └──────────┬────────┘
                                    │ SMTP
                                    ▼
                         ┌─────────────────────┐
-                        │  Corporate Mailbox    │
-                        └──────────┬───────────┘
+                        │  Corporate Mailbox  │
+                        └──────────┬──────────┘
                                    │ IMAP (polling)
                                    ▼
                         ┌─────────────────────┐
-                        │  email_listener.py    │
-                        │  Background worker     │
-                        │  → injects replies into│
-                        │    the agent graph      │
+                        │  email_listener.py  │
+                        │  Background worker  │
+                        │ → injects replies in│
+                        │ to the agent graph  │
                         └─────────────────────┘
 ```
 
@@ -98,7 +99,7 @@ This project moves beyond linear, single-turn conversational chatbots by impleme
 2. The LangGraph agent retrieves grounded context from ChromaDB and reasons via Groq's Llama 3.1 8B model.
 3. If the query requires escalation (e.g., "email the finance department"), the agent **freezes execution** at the email tool call and waits for human approval.
 4. Once approved, the email is dispatched via SMTP and the thread ID is tracked.
-5. The IMAP worker polls for a reply, parses it, and resumes the frozen graph with the new information — closing the loop without any manual re-prompting.
+5. The IMAP worker polls for a reply, parses it, and resumes the frozen graph with the new information — closing the loop without any manual re-prompting , then notification appears on the frontend by short polling.
 
 ---
 
