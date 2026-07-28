@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NextBridge Agentic HR Portal</title>
     <!-- Marked.js for rendering Markdown output from the LLM -->
+    <!-- This library instantly detects those raw Markdown symbols send by LLM and converts them into actual HTML elements[formated response] -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         :root { --primary: #0052cc; --bg: #f4f5f7; --chat-bg: #ffffff; }
@@ -38,6 +39,34 @@
         }
         .reset-btn:hover {
             background: rgba(255, 255, 255, 0.3);
+        }
+        /* Microphone Button Styling */
+        .mic-btn { 
+            background: #fff; 
+            border: 1px solid #ccc; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            padding: 0 15px; 
+            font-size: 1.2rem; 
+            transition: 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .mic-btn:hover { background: #eee; }
+        
+        /* Active Recording State */
+        .mic-btn.recording { 
+            background: #ffebee; 
+            border-color: #f44336; 
+            color: #f44336; 
+            animation: pulse-mic 1.5s infinite; 
+        }
+        
+        @keyframes pulse-mic { 
+            0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.4); } 
+            70% { box-shadow: 0 0 0 10px rgba(244, 67, 54, 0); } 
+            100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); } 
         }
         .messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
         .message { max-width: 85%; padding: 12px 16px; border-radius: 8px; line-height: 1.5; font-size: 0.95rem; position: relative; word-wrap: break-word; }
@@ -78,6 +107,8 @@
     <div class="messages" id="messages"></div>
     <div class="input-area">
         <input type="text" id="userInput" placeholder="Ask about HR policies, leaves, complaints, or meal subscriptions..." onkeydown="if(event.key==='Enter') sendMessage()" />
+        <!-- New Mic Button -->
+        <button id="micBtn" class="mic-btn" onclick="toggleSTT()" title="Click to speak">🎤</button>
         <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
     </div>
 </div>
@@ -257,6 +288,74 @@
         } else {
             alert('Your browser does not support Text-to-Speech.');
         }
+    }
+    // ==========================================
+    // Speech-to-Text (STT) Implementation
+    // ==========================================
+    let recognition;
+    let isRecording = false;
+    const micBtn = document.getElementById('micBtn');
+
+    // Check for browser support (Chrome/Edge use webkit prefix)
+    if ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        
+        recognition.continuous = false; // Stop listening automatically when the user pauses
+        recognition.interimResults = true; // Show words on the screen as they are being spoken
+        recognition.lang = 'en-US'; // Default transcription language
+
+        recognition.onstart = () => {
+            isRecording = true;
+            micBtn.classList.add('recording');
+            inputField.placeholder = "Listening...";
+        };
+
+        recognition.onresult = (event) => {
+            let interimTranscript = '';
+            let finalTranscript = '';
+
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                if (event.results[i].isFinal) {
+                    finalTranscript += event.results[i][0].transcript;
+                } else {
+                    interimTranscript += event.results[i][0].transcript;
+                }
+            }
+            
+            // Populate the input field dynamically
+            inputField.value = finalTranscript || interimTranscript;
+        };
+
+        recognition.onerror = (event) => {
+            console.error("STT Error:", event.error);
+            stopRecordingState();
+        };
+
+        recognition.onend = () => {
+            stopRecordingState();
+        };
+    } else {
+        // Hide the microphone button if the browser doesn't support the Web Speech API
+        micBtn.style.display = 'none';
+        console.warn("Speech Recognition API is not supported in this browser.");
+    }
+
+    function toggleSTT() {
+        if (!recognition) return alert("Speech-to-Text is not supported in your browser.");
+        
+        if (isRecording) {
+            recognition.stop();
+        } else {
+            inputField.value = ''; // Clear previous text before starting
+            recognition.start();
+        }
+    }
+
+    function stopRecordingState() {
+        isRecording = false;
+        micBtn.classList.remove('recording');
+        inputField.placeholder = "Ask about HR policies, leaves, complaints, or meal subscriptions...";
     }
     function resetChat() {
         const confirmReset = confirm("Are you sure you want to start a new chat? This will clear the agent's memory for this session.");
