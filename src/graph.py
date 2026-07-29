@@ -3,7 +3,8 @@ LangGraph state machine topology and nodes.
 """
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_groq import ChatGroq
+#from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage ,trim_messages
 from src.state import AgentState
 from src.tools import (
@@ -14,8 +15,16 @@ from src.tools import (
 )
 
 # Initialize LLM
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.1)
+#llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.1)
 
+
+# Initialize the private NextBridge LLM endpoint
+llm = ChatOpenAI(
+    base_url="https://virtually-aus-yours-boutique.trycloudflare.com/v1", # Note the /v1 suffix (standard for OpenAI-compatible endpoints)
+    api_key="not-needed", # Private endpoints usually ignore this, but LangChain requires a string here
+    model="qwen3:30b",  # Optimized for LangGraph tool calling
+    temperature=0.1, # Low temperature for deterministic responses
+)
 tools = [
     search_hr_documents,
     guardrailed_web_search,
