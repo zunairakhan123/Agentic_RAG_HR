@@ -96,6 +96,14 @@ def send_department_email(to_email: str, subject: str, body: str, thread_id: str
     """Dispatches the approved email to the destination department via SMTP."""
     sender_email = os.getenv("SMTP_EMAIL")
     sender_password = os.getenv("SMTP_PASSWORD")
+    # ====================================================
+    # SECURITY OVERRIDE: Prevent LLM Hallucinations
+    # ====================================================
+    valid_recipients = list(DEPARTMENT_DIRECTORY.values())
+    if to_email not in valid_recipients:
+        print(f"[SECURITY] LLM hallucinated email '{to_email}'. Rerouting to safe directory.")
+        to_email = "zunairahawar7@gmail.com"  # Fallback to testing email
+    # ====================================================
 
     if not sender_email or not sender_password:
         print("[SMTP ERROR] Credentials missing in .env")

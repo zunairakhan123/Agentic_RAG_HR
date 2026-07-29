@@ -4,7 +4,7 @@ LangGraph state machine topology and nodes.
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage ,trim_messages
 from src.state import AgentState
 from src.tools import (
     search_hr_documents,
@@ -45,7 +45,16 @@ async def agent_node(state: AgentState):
             "   - For non-work queries (e.g., fashion, sports), politely decline."
         )
     )
-    messages = [system_instruction] + state["messages"]
+    # This prevents state payload bloat regardless of conversation length
+    trimmed_messages = trim_messages(
+        state["messages"],
+        max_tokens=10,  # Keep only the last 10 messages in the thread
+        strategy="last",
+        token_counter=len,  # 'len' counts the number of messages in the list
+        allow_partial=False,
+        start_on="human",
+    )
+    messages = [system_instruction] + trimmed_messages
     
     response = await llm_with_tools.ainvoke(messages)
     
