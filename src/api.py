@@ -11,6 +11,9 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from src.graph import builder
 from typing import Dict, List
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 hr_graph = None
 _memory_context = None
@@ -118,25 +121,6 @@ async def approve_action_endpoint(request: EmailApprovalRequest):
         media_type="text/event-stream",
     )
 
-# @app.post("/webhook/department-reply")
-# async def department_reply_webhook(data: DepartmentReplyWebhook):
-#     config = {"configurable": {"thread_id": data.thread_id}}
-
-#     notification = (
-#         f"SYSTEM NOTIFICATION: The {data.department} department has replied to your request.\n"
-#         f"Reply Content: '{data.reply_body}'\n\n"
-#         f"Task: Notify the user about this response immediately, and ask if they want to send an acknowledgment email back."
-#     )
-
-#     await hr_graph.aupdate_state(config, {"messages": [HumanMessage(content=notification)]})
-#     result = await hr_graph.ainvoke(None, config)
-#     agent_msg = result["messages"][-1].content
-
-#     return {
-#         "status": "User notified successfully",
-#         "thread_id": data.thread_id,
-#         "agent_response": agent_msg,
-#     }
 @app.post("/webhook/department-reply")
 async def department_reply_webhook(data: DepartmentReplyWebhook):
     config = {"configurable": {"thread_id": data.thread_id}}
@@ -165,6 +149,58 @@ async def department_reply_webhook(data: DepartmentReplyWebhook):
         "status": "User notified successfully",
         "thread_id": data.thread_id
     }
+
+# Replace your Pipecat WebSocket with this:
+@app.websocket("/ws/voice/{thread_id}")
+async def voice_websocket(websocket: WebSocket, thread_id: str):
+    """Persistent bidirectional connection for Voice Mode."""
+    await websocket.accept()
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        while True:
+            # 1. Wait for transcribed text from the frontend
+            user_text = await websocket.receive_text()
+            print(f"[Voice Mode] Received: {user_text}")
+            
+            # 2. Execute LangGraph and stream tokens
+            async for event in hr_graph.astream_events(
+                {"messages": [HumanMessage(content=user_text)]}, 
+                config=config, 
+                version="v2"
+            ):
+                # Stream LLM tokens
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"].content
+                    if isinstance(chunk, list) and len(chunk) > 0:
+                        chunk = chunk[0].get("text", "")
+                        
+                    if chunk:
+                        await websocket.send_text(json.dumps({"type": "token", "content": chunk}))
+                
+                # Stream Tool Execution status
+                elif event["event"] == "on_tool_start":
+                    tool_name = event["name"]
+                    await websocket.send_text(json.dumps({"type": "status", "content": f"Checking {tool_name}..."}))
+            
+            # 3. Signal that the AI has finished its turn
+            await websocket.send_text(json.dumps({"type": "done"}))
+            
+    except WebSocketDisconnect:
+        print(f"[Voice Mode] Session {thread_id} disconnected normally.")
+    except Exception as e:
+        print(f"[Voice Mode] ERROR: {str(e)}")
+        await websocket.send_text(json.dumps({"type": "error", "content": "An error occurred while processing your request."}))
+# ==========================================
+# Frontend Serving
+# ==========================================
+# 1. Serve the main index.html on the root URL
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("frontend/index.html")
+
+# 2. (Optional) Mount the frontend directory if you add CSS/JS files later
+# app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     import uvicorn

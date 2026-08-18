@@ -108,6 +108,7 @@
     <div class="input-area">
         <input type="text" id="userInput" placeholder="Ask about HR policies, leaves, complaints, or meal subscriptions..." onkeydown="if(event.key==='Enter') sendMessage()" />
         <!-- New Mic Button -->
+        <button id="voiceModeBtn" class="reset-btn" onclick="toggleVoiceMode()">🎙️ Enter Voice Mode</button>
         <button id="micBtn" class="mic-btn" onclick="toggleSTT()" title="Click to speak">🎤</button>
         <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
     </div>
@@ -290,72 +291,165 @@
         }
     }
     // ==========================================
-    // Speech-to-Text (STT) Implementation
+    // Standard Push-to-Talk STT (The 🎤 Button)
     // ==========================================
-    let recognition;
+    let recognition = null;
     let isRecording = false;
     const micBtn = document.getElementById('micBtn');
 
-    // Check for browser support (Chrome/Edge use webkit prefix)
     if ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window) {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         recognition = new SpeechRecognition();
-        
-        recognition.continuous = false; // Stop listening automatically when the user pauses
-        recognition.interimResults = true; // Show words on the screen as they are being spoken
-        recognition.lang = 'en-US'; // Default transcription language
+        recognition.continuous = false;
+        recognition.interimResults = true;
 
         recognition.onstart = () => {
             isRecording = true;
             micBtn.classList.add('recording');
             inputField.placeholder = "Listening...";
         };
-
         recognition.onresult = (event) => {
-            let interimTranscript = '';
-            let finalTranscript = '';
-
+            let transcript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
-                if (event.results[i].isFinal) {
-                    finalTranscript += event.results[i][0].transcript;
-                } else {
-                    interimTranscript += event.results[i][0].transcript;
-                }
+                transcript += event.results[i][0].transcript;
             }
-            
-            // Populate the input field dynamically
-            inputField.value = finalTranscript || interimTranscript;
+            inputField.value = transcript;
         };
-
-        recognition.onerror = (event) => {
-            console.error("STT Error:", event.error);
-            stopRecordingState();
-        };
-
-        recognition.onend = () => {
-            stopRecordingState();
-        };
-    } else {
-        // Hide the microphone button if the browser doesn't support the Web Speech API
-        micBtn.style.display = 'none';
-        console.warn("Speech Recognition API is not supported in this browser.");
+        recognition.onerror = () => stopRecordingState();
+        recognition.onend = () => stopRecordingState();
     }
 
     function toggleSTT() {
         if (!recognition) return alert("Speech-to-Text is not supported in your browser.");
-        
         if (isRecording) {
             recognition.stop();
         } else {
-            inputField.value = ''; // Clear previous text before starting
+            inputField.value = '';
             recognition.start();
         }
     }
 
     function stopRecordingState() {
         isRecording = false;
-        micBtn.classList.remove('recording');
+        if(micBtn) micBtn.classList.remove('recording');
         inputField.placeholder = "Ask about HR policies, leaves, complaints, or meal subscriptions...";
+    }
+
+    // ==========================================
+    // Continuous Voice Agent (Streaming TTS & Barge-in)
+    // ==========================================
+    let voiceSocket = null;
+    let voiceRecognition = null;
+    let isVoiceModeActive = false;
+    let currentAgentResponse = "";
+    let currentVoiceUINode = null; 
+    let sentenceBuffer = ""; // Buffers text so the AI speaks smoothly sentence-by-sentence
+
+    if ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        voiceRecognition = new SpeechRecognition();
+        voiceRecognition.continuous = true;  // Keep the mic completely open for barge-in
+        voiceRecognition.interimResults = false; 
+        voiceRecognition.lang = 'en-US';
+
+        voiceRecognition.onresult = (event) => {
+            if (!isVoiceModeActive) return;
+            
+            const transcript = event.results[event.results.length - 1][0].transcript.trim();
+            if (!transcript) return;
+
+            // [BARGE-IN]: If the AI is currently speaking, shut it up instantly!
+            if (window.speechSynthesis.speaking) {
+                window.speechSynthesis.cancel();
+            }
+
+            appendMessage('user', transcript);
+            
+            if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
+                voiceSocket.send(transcript);
+                
+                // Reset states for the new turn
+                currentAgentResponse = ""; 
+                currentVoiceUINode = null; 
+                sentenceBuffer = ""; 
+            }
+        };
+
+        voiceRecognition.onend = () => {
+            if (isVoiceModeActive) {
+                try { voiceRecognition.start(); } catch(e) {}
+            }
+        };
+    }
+
+    function toggleVoiceMode() {
+        const btn = document.getElementById('voiceModeBtn');
+        
+        if (isVoiceModeActive) {
+            isVoiceModeActive = false;
+            btn.innerHTML = "🎙️ Enter Voice Mode";
+            btn.style.backgroundColor = "";
+            window.speechSynthesis.cancel(); 
+            if (voiceRecognition) voiceRecognition.stop();
+            if (voiceSocket) voiceSocket.close();
+            return;
+        }
+
+        isVoiceModeActive = true;
+        btn.innerHTML = "🛑 Stop Voice Mode";
+        btn.style.backgroundColor = "#d32f2f"; 
+        
+        voiceSocket = new WebSocket(`ws://localhost:8000/ws/voice/${threadId}`);
+        
+        voiceSocket.onopen = () => {
+            speakVoiceAgent("Voice mode activated. I am listening.");
+            try { voiceRecognition.start(); } catch(e) {}
+        };
+
+        voiceSocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            if (data.type === "token") {
+                currentAgentResponse += data.content;
+                sentenceBuffer += data.content; 
+                
+                // 1. Render text to UI instantly
+                if (!currentVoiceUINode) {
+                    const msgDiv = appendMessage('assistant', '');
+                    currentVoiceUINode = document.createElement('span');
+                    msgDiv.appendChild(currentVoiceUINode);
+                }
+                currentVoiceUINode.innerHTML = typeof marked !== 'undefined' ? marked.parse(currentAgentResponse) : currentAgentResponse;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+                // 2. [STREAMING TTS FIX]: Check if we hit the end of a sentence
+                let match = sentenceBuffer.match(/([.?!])\s/);
+                if (match) {
+                    let splitIndex = match.index + 1;
+                    let sentenceToSpeak = sentenceBuffer.substring(0, splitIndex);
+                    sentenceBuffer = sentenceBuffer.substring(splitIndex).trimStart();
+                    
+                    speakVoiceAgent(sentenceToSpeak);
+                }
+
+            } else if (data.type === "done") {
+                // Speak whatever is left when LangGraph finishes
+                if (sentenceBuffer.trim().length > 0) {
+                    speakVoiceAgent(sentenceBuffer);
+                    sentenceBuffer = "";
+                }
+            }
+        };
+    }
+
+    function speakVoiceAgent(text) {
+        if (!('speechSynthesis' in window)) return;
+        
+        const cleanText = text.replace(/[*_#`]/g, '').trim();
+        if (!cleanText) return;
+
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        window.speechSynthesis.speak(utterance);
     }
     function resetChat() {
         const confirmReset = confirm("Are you sure you want to start a new chat? This will clear the agent's memory for this session.");
