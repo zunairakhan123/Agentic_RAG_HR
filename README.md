@@ -226,7 +226,7 @@ python -m src.email_listener
 
 **Launch the client:**
 
-Open `frontend/index.html` in any modern browser. The frontend short-polls the FastAPI backend and subscribes to SSE for streamed agent responses.
+Open `start frontend/index.html` in any modern browser. The frontend short-polls the FastAPI backend and subscribes to SSE for streamed agent responses.
 
 ---
 

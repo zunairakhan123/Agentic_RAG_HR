@@ -20,7 +20,7 @@ from src.tools import (
 
 # Initialize the private NextBridge LLM endpoint
 llm = ChatOpenAI(
-    base_url="https://virtually-aus-yours-boutique.trycloudflare.com/v1", # Note the /v1 suffix (standard for OpenAI-compatible endpoints)
+    base_url="https://herb-petite-era-glasses.trycloudflare.com/v1", # Note the /v1 suffix (standard for OpenAI-compatible endpoints)
     api_key="not-needed", # Private endpoints usually ignore this, but LangChain requires a string here
     model="qwen3:30b",  # Optimized for LangGraph tool calling
     temperature=0.1, # Low temperature for deterministic responses
