@@ -42,6 +42,9 @@ hr_agent_memory.db
 data/
 chroma_db/
 vector_db/
+semantic_cache/
+datasets/
+results/
 
 # =========================
 # Logs and Caches

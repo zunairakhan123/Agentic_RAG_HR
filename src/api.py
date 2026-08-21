@@ -14,6 +14,10 @@ from typing import Dict, List
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from src.cache import check_semantic_cache, save_to_semantic_cache
+import uvicorn
+import sys
+import asyncio
 
 hr_graph = None
 _memory_context = None
@@ -60,6 +64,7 @@ class DepartmentReplyWebhook(BaseModel):
 
 async def event_generator(thread_id: str, message: str):
     config = {"configurable": {"thread_id": thread_id}}
+    full_response = "" 
 
     async for event in hr_graph.astream_events(
         {"messages": [HumanMessage(content=message)]},
@@ -67,12 +72,28 @@ async def event_generator(thread_id: str, message: str):
         version="v2",
     ):
         kind = event["event"]
+        # Determine exactly which node generated this event
+        node_name = event.get("metadata", {}).get("langgraph_node", "")
 
-        if kind == "on_chat_model_stream":
-            content = event["data"]["chunk"].content
+        # 1. Stream ONLY the actual user-facing LLM nodes (hides internal JSON)
+        if kind == "on_chat_model_stream" and node_name in ["generation", "agent"]:
+            chunk = event["data"]["chunk"]
+            content = chunk.content if hasattr(chunk, "content") else chunk
+            if isinstance(content, list) and len(content) > 0:
+                content = content[0].get("text", "")
             if content:
+                full_response += content 
                 yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
 
+        # 1b. [NEW] Catch the Guardrail rejection and stream the polite message
+        elif kind == "on_chain_end" and node_name == "guardrail":
+            output = event["data"].get("output", {})
+            if isinstance(output, dict) and output.get("final_status") == "guardrail_blocked":
+                msg = output["messages"][0].content
+                full_response += msg
+                yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
+
+        # 2. Stream ReAct Tool executions
         elif kind == "on_tool_start":
             tool_name = event["name"]
             tool_inputs = event["data"].get("input")
@@ -81,11 +102,32 @@ async def event_generator(thread_id: str, message: str):
         elif kind == "on_tool_end":
             output = event["data"].get("output")
             yield f"data: {json.dumps({'type': 'tool_end', 'output': str(output)})}\n\n"
+            
+        # 3. Stream CRAG Node transitions
+        elif kind == "on_chain_start":
+            if node_name in ["retrieval", "grader", "rewrite", "reflection"]:
+                status_msg = f"Executing {node_name}..."
+                yield f"data: {json.dumps({'type': 'status', 'content': status_msg})}\n\n"
+
+    # Only cache if it's a substantive response
+    if full_response.strip() and len(full_response) > 10:
+        save_to_semantic_cache(message, full_response)
 
     yield "data: [DONE]\n\n"
 
 # In-memory queue to hold proactive agent messages for the frontend
 pending_notifications: Dict[str, List[str]] = {}
+
+async def fake_stream_generator(text: str):
+    """Simulates the SSE stream to instantly render cached responses."""
+    yield f"data: {json.dumps({'type': 'status', 'content': '⚡ Served instantly from Semantic Cache'})}\n\n"
+    await asyncio.sleep(0.1) # Tiny pause for UI to catch the status
+    yield f"data: {json.dumps({'type': 'token', 'content': text})}\n\n"
+    yield "data: [DONE]\n\n"
+
+# ==========================================
+# Endpoints for Frontend & Webhooks
+# ==========================================
 
 @app.get("/api/notifications/{thread_id}")
 async def get_notifications(thread_id: str):
@@ -94,8 +136,19 @@ async def get_notifications(thread_id: str):
     msgs = pending_notifications.pop(thread_id, [])
     return {"notifications": msgs}
 
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
+    # 1. Check cache first
+    cached_answer = check_semantic_cache(request.message)
+    if cached_answer:
+        # If cache hit, stream the cached answer instantly and skip LangGraph
+        return StreamingResponse(
+            fake_stream_generator(cached_answer),
+            media_type="text/event-stream"
+        )
+    
+    # 2. If no cache, run the LangGraph event generator
     return StreamingResponse(
         event_generator(request.thread_id, request.message),
         media_type="text/event-stream",
@@ -178,19 +231,23 @@ async def voice_websocket(websocket: WebSocket, thread_id: str):
                     if chunk:
                         await websocket.send_text(json.dumps({"type": "token", "content": chunk}))
                 
-                # Stream Tool Execution status
+                # Stream Tool Execution status (Emails, Web)
                 elif event["event"] == "on_tool_start":
                     tool_name = event["name"]
                     await websocket.send_text(json.dumps({"type": "status", "content": f"Checking {tool_name}..."}))
-            
-            # 3. Signal that the AI has finished its turn
-            await websocket.send_text(json.dumps({"type": "done"}))
+                    
+                # [NEW] Stream CRAG Node Execution status (RAG)
+                elif event["event"] == "on_chain_start":
+                    node_name = event["name"]
+                    if node_name in ["retrieval", "grader", "rewrite", "reflection"]:
+                        await websocket.send_text(json.dumps({"type": "status", "content": f"Running {node_name} phase..."}))
             
     except WebSocketDisconnect:
         print(f"[Voice Mode] Session {thread_id} disconnected normally.")
     except Exception as e:
         print(f"[Voice Mode] ERROR: {str(e)}")
         await websocket.send_text(json.dumps({"type": "error", "content": "An error occurred while processing your request."}))
+        
 # ==========================================
 # Frontend Serving
 # ==========================================
@@ -199,9 +256,11 @@ async def voice_websocket(websocket: WebSocket, thread_id: str):
 async def serve_frontend():
     return FileResponse("frontend/index.html")
 
-# 2. (Optional) Mount the frontend directory if you add CSS/JS files later
-# app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
-    import uvicorn
+    
+    # Windows asyncio policy fix to prevent EventLoop errors with SQLite/FastAPI
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
     uvicorn.run("src.api:app", host="0.0.0.0", port=8000, reload=False)
