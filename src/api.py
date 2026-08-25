@@ -9,15 +9,18 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from src.graph import builder
+from src.graph import supervisor_builder
 from typing import Dict, List
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from src.cache import check_semantic_cache, save_to_semantic_cache
+from src.cache import check_semantic_cache,init_frequency_db
 import uvicorn
 import sys
 import asyncio
+import warnings
+# Suppress harmless Pydantic V2 serialization warnings from LangChain structured outputs
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 hr_graph = None
 _memory_context = None
@@ -26,14 +29,16 @@ _memory_context = None
 async def lifespan(app: FastAPI):
     global hr_graph, _memory_context
     
-    # Initialize the async SQLite checkpointer on startup
+    # 1. Initialize the Persistent Frequency Cache DB
+    await init_frequency_db()
+    
+    # 2. Initialize the async SQLite checkpointer on startup
     _memory_context = AsyncSqliteSaver.from_conn_string("hr_agent_memory.db")
     memory = await _memory_context.__aenter__()
     await memory.setup()
     
-    # The agent can now freely search PDFs and draft emails. 
-    # Sending emails is protected by the LLM's system prompt guardrails.
-    hr_graph = builder.compile(checkpointer=memory)
+    # 3. Compile the graph
+    hr_graph = supervisor_builder.compile(checkpointer=memory)
     yield
     
     # Clean up the DB connection on server shutdown
@@ -84,8 +89,11 @@ async def event_generator(thread_id: str, message: str):
             if content:
                 full_response += content 
                 yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+        # [NEW FIX]: Trigger UI wipe when Self-RAG starts a new draft
+        elif kind == "on_chat_model_start" and node_name == "generation":
+            yield f"data: {json.dumps({'type': 'clear'})}\n\n"
 
-        # 1b. [NEW] Catch the Guardrail rejection and stream the polite message
+        # 1b. Catch the Guardrail rejection and stream the polite message
         elif kind == "on_chain_end" and node_name == "guardrail":
             output = event["data"].get("output", {})
             if isinstance(output, dict) and output.get("final_status") == "guardrail_blocked":
@@ -103,16 +111,31 @@ async def event_generator(thread_id: str, message: str):
             output = event["data"].get("output")
             yield f"data: {json.dumps({'type': 'tool_end', 'output': str(output)})}\n\n"
             
-        # 3. Stream CRAG Node transitions
+        # 3. Stream Node Transitions for UI Status
         elif kind == "on_chain_start":
-            if node_name in ["retrieval", "grader", "rewrite", "reflection"]:
-                status_msg = f"Executing {node_name}..."
+            tracked_nodes = [
+                "guardrail", "router", "rag_wrapper", "agent", 
+                "rag_router", "retrieve", "grader", "rewrite", "reflection"
+            ]
+            if node_name in tracked_nodes:
+                # Map internal names to professional UI labels
+                pretty_names = {
+                    "guardrail": "Input Guardrail",
+                    "router": "Supervisor Routing",
+                    "rag_wrapper": "Initializing RAG",
+                    "agent": "ReAct Agent",
+                    "rag_router": "Analyzing Complexity",
+                    "retrieve": "Retrieving Documents",
+                    "grader": "Grading Context",
+                    "rewrite": "Optimizing Query",
+                    "reflection": "Validating Answer"
+                }
+                display_name = pretty_names.get(node_name, node_name)
+                status_msg = f"Executing {display_name}..."
                 yield f"data: {json.dumps({'type': 'status', 'content': status_msg})}\n\n"
 
-    # Only cache if it's a substantive response
-    if full_response.strip() and len(full_response) > 10:
-        save_to_semantic_cache(message, full_response)
-
+    # [FIX]: Removed the old save_to_semantic_cache() block!
+    # Caching is now handled entirely in the background by track_and_promote.
     yield "data: [DONE]\n\n"
 
 # In-memory queue to hold proactive agent messages for the frontend

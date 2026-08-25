@@ -1,18 +1,33 @@
+
 """
 LangGraph nodes for the NextBridge HR Agent.
 Contains the Guardrail and Adaptive Router logic using Pydantic structured outputs.
 """
-
+import os
 from typing import Literal
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from src.state import AgentState
+from src.state import SupervisorState, RAGState
+from langchain_groq import ChatGroq
 from src.retrievers import get_simple_retriever, get_complex_retriever
-from langchain_core.messages import AIMessage
 
-# Initialize local LLM
-llm = ChatOpenAI(
+load_dotenv()
+
+# ==========================================
+# 1. Dual-Model Initialization
+# ==========================================
+
+# Fast LLM (Cloud LPU) - Ultra-low latency for Pydantic routing (< 300ms)
+fast_llm = ChatGroq(
+    api_key=os.getenv("GROQ_API_KEY"),
+    model="openai/gpt-oss-120b",
+    temperature=0.0
+)
+
+# Primary LLM (24B) - Optimized for generation, deep reasoning, and nuance
+primary_llm = ChatOpenAI(
     base_url="https://relation-creature-tap-bradley.trycloudflare.com/v1",
     api_key="not-needed",
     model="qwen3:30b",
@@ -20,339 +35,228 @@ llm = ChatOpenAI(
 )
 
 # ==========================================
-# Pydantic Schemas for Structured Output
+# Pydantic Schemas 
 # ==========================================
-
 class GuardrailResult(BaseModel):
-    is_valid: bool = Field(description="True if the query is related to work, HR, software, or internal emails. False if off-topic.")
-    reason: str = Field(description="Brief explanation for why the query was accepted or rejected.")
+    is_valid: bool = Field(description="True if query is valid, False if off-topic.")
+    reason: str = Field(description="Reasoning for the decision.")
 
-class RouterResult(BaseModel):
-    category: Literal["email", "simple", "complex", "chat"] = Field(
-        description=(
-            "'email': User explicitly wants to draft or send an internal email. "
-            "'simple': Direct factual policy lookup. "
-            "'complex': Ambiguous, multi-step, scenario-based, multi-part, or requires reasoning across multiple policy sections. "
-            "'chat': The user is just saying a general greeting (e.g., hi, hello, thanks , how are you etc.) "
-        )
-    )
+class SupervisorRouterResult(BaseModel):
+    category: Literal["rag", "email", "web", "chat"] = Field(description="High-level orchestration category.")
+
+class RAGRouterResult(BaseModel):
+    category: Literal["simple", "complex"] = Field(description="Depth of retrieval required.")
+    intent_key: str = Field(description="A 2-4 word snake_case canonical categorization of the user's intent. (e.g., 'annual_leave_policy', 'ceo_name', 'maternity_benefits')")
 
 class DocumentGraderResult(BaseModel):
-    is_relevant: bool = Field(
-        description="True if the documents contain sufficient evidence to answer the query. False if irrelevant or missing key information."
-    )
-    reason: str = Field(
-        description="Brief explanation of what evidence was found or what is missing."
-    )
+    is_relevant: bool = Field(description="True if documents can answer the query.")
+    reason: str = Field(description="Explanation of evidence.")
 
 class RewriteResult(BaseModel):
-    rewritten_query: str = Field(
-        description="A better, more optimized search query based on the failure of the previous one."
-    )
+    rewritten_query: str = Field(description="Optimized search query.")
 
 class ReflectionResult(BaseModel):
-    is_grounded: bool = Field(
-        description="True if every claim in the generated answer is directly supported by the context. False if it hallucinates."
-    )
-    error_type: Literal["none", "missing_evidence", "wording_problem"] = Field(
-        description="If is_grounded is False, classify the error. 'missing_evidence' if the context lacks the facts to answer the user. 'wording_problem' if the context has the facts but the generator added unprompted external knowledge."
-    )
+    is_grounded: bool = Field(description="True if no hallucinations.")
+    error_type: Literal["none", "missing_evidence", "wording_problem"] = Field(description="Type of hallucination.")
     reason: str = Field(description="Explanation of the evaluation.")
 
 # ==========================================
-# Node Implementations
+# SUPERVISOR NODES (Uses SupervisorState)
 # ==========================================
 
-async def input_guardrail_node(state: AgentState) -> dict:
-    """
-    Part 11: Input Guardrail.
-    Returns a state update dictionary. Appends a polite rejection if off-topic.
-    """
+async def input_guardrail_node(state: SupervisorState) -> dict:
     user_query = state["messages"][-1].content
     
-    prompt = f"""You are a strict Input Guardrail for the NextBridge HR AI Agent.
-Evaluate the following user query.
-
-Valid topics: General greetings (e.g., "hi", "hello", "who are you"), NextBridge HR policies, leaves, benefits, payroll, drafting/sending internal emails, software engineering context.
-Invalid topics: Coding help, general knowledge, pop culture, creative writing, fashion, etc.
-
-Query: "{user_query}"
+    last_ai_message = ""
+    for msg in reversed(state["messages"][:-1]):  
+        if isinstance(msg, AIMessage):
+            last_ai_message = msg.content
+            break
+            
+    context_str = f"Context (Previous AI Message): {last_ai_message}\n" if last_ai_message else ""
+    
+    prompt = f"""You are the frontline security guardrail for the NextBridge HR Agent.
+    User's input: "{user_query}"
+    
+    Determine if this input is allowed based on these strict rules:
+    
+    ALLOWED (Return "pass"):
+    1. HR & Workplace Administration: Any mention of leaves, payroll, policies, or internal requests.
+    2. Office Perks & Operations: Meal subscriptions, seating, IT requests, or facility management.
+    3. Departmental Routing: Mentions of specific departments (MIS, HR, MEAL, ADMIN).
+    4. NextBridge Info: Questions about the software company, CEO,personal staff information, or locations .
+    5. Casual Chat: Greetings, thanks, or general conversation.
+    
+    BLOCKED (Return "block"):
+    - Coding requests (e.g., "write python code").
+    - Math, general trivia, fashion, or external entertainment.
+{context_str}
+Latest User Query: "{user_query}"
 """
-    
-    structured_llm = llm.with_structured_output(GuardrailResult)
-    
+    structured_llm = fast_llm.with_structured_output(GuardrailResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-        
         if not result.is_valid:
-            # FIX: Create a polite rejection message for the user
             fallback = f"I am strictly a NextBridge HR Assistant. I cannot assist with this query. (Reason: {result.reason})"
-            return {
-                "query": user_query,
-                "retrieval_attempts": 0,
-                "generation_attempts": 0,
-                "final_status": "guardrail_blocked",
-                "correction_reason": result.reason,
-                "messages": [AIMessage(content=fallback)] # <--- Saves to memory
-            }
-        else:
-            return {
-                "query": user_query,
-                "retrieval_attempts": 0,
-                "generation_attempts": 0,
-                "final_status": "processing",
-                "correction_reason": None
-            }
-            
-    except Exception as e:
-        print(f"[Guardrail Error] Defaulting to valid. Error: {e}")
-        return {
-            "query": user_query,
-            "retrieval_attempts": 0,
-            "generation_attempts": 0,
-            "final_status": "processing"
-        }
+            return {"final_status": "guardrail_blocked", "messages": [AIMessage(content=fallback)]}
+        return {"final_status": "processing"}
+    except Exception:
+        return {"final_status": "processing"}
 
 
-async def adaptive_router_node(state: AgentState) -> dict:
-    """
-    Adaptive Query Routing.
-    Returns a state update dictionary containing only the classified query_type.
-    """
-    # If guardrail blocked, do not update the routing state
+# ==========================================
+# SUPERVISOR NODES (Parent Graph)
+# ==========================================
+async def adaptive_router_node(state: SupervisorState) -> dict:
     if state.get("final_status") == "guardrail_blocked":
         return {}
+        
+    user_query = state["messages"][-1].content
 
-    user_query = state.get("query", state["messages"][-1].content)
+    # [PRODUCTION FIX]: Bulletproof prompting for the Router
+    prompt = f"""Analyze the user's latest query and classify it into EXACTLY ONE of the following categories:
 
-    prompt = f"""You are a Query Router for an HR Agent.
-Classify the following query into exactly ONE of these categories:
-- "email": The user explicitly wants to draft or send an email.
-- "simple": A direct, single-fact policy lookup (e.g., "How many sick leaves do I get?").
-- "complex": Ambiguous, multi-part, or requires scenario analysis (e.g., "Do I lose my PTO if I don't use it?").
-- "chat": The user is just saying a general greeting (e.g., "hi", "hello", "thanks").
+    - "chat": The query is a simple greeting (e.g., "hi", "hey", "hello", "good morning"), an expression of gratitude ("thanks"), or casual chat.
+    - "email": The user is asking to draft, write, send, or approve an internal department email.
+    - "web": The user is asking about the current CEO, latest news, or public information about NextBridge software company.
+    - "rag": The user is asking a question about internal HR policies, employee handbooks, leaves, payroll, or benefits.
 
-Query: "{user_query}"
-"""
+    Query: "{user_query}"
+    """
     
-    # Bind the Pydantic schema to the LLM
-    structured_llm = llm.with_structured_output(RouterResult)
-    
+    structured_llm = fast_llm.with_structured_output(SupervisorRouterResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
         return {"query_type": result.category}
-        
     except Exception as e:
-        print(f"[Router Error] Defaulting to 'complex'. Error: {e}")
-        return {"query_type": "complex"}
+        print(f"[Router Warning] Parsing failed, defaulting to 'chat'. Error: {e}")
+        # Default to chat for short/confusing queries to prevent heavy RAG/Web executions
+        return {"query_type": "chat"}
 
-async def retrieval_node(state: AgentState) -> dict:
+
+# ==========================================
+# RAG SUBGRAPH NODES (Child Graph)
+# ==========================================
+async def rag_router_node(state: RAGState) -> dict:
+    """The Internal RAG Decider (Simple vs Complex)."""
+    user_query = state.get("query")
+    prompt = f"""You are a RAG Execution Router.
+    Classify the HR query into ONE category:
+    - "simple": A direct, single-fact lookup (e.g., "what is the leave policy?", "how many sick days?").
+    - "complex": Ambiguous, multi-part, or requires scenario analysis (e.g., "If I take unpaid leave, do I get my medical allowance?").
+    ALSO, extract the core semantic intent of the query into a short snake_case string (e.g., "sick_leave_policy").
+
+    Query: "{user_query}"
     """
-    Executes adaptive retrieval and tracks telemetry.
-    Returns the retrieved documents and increments the attempt counter.
-    """
-    # 1. Determine which query to use (original vs. rewritten)
+    structured_llm = fast_llm.with_structured_output(RAGRouterResult, method="json_schema")
+    try:
+        result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        return {
+            "query_type": result.category,
+            "intent_key": result.intent_key  # Save the semantic key
+        }
+    except Exception:
+        return {"query_type": "complex", "intent_key": "unknown_complex"}
+
+async def retrieval_node(state: RAGState) -> dict:
+    """Uses the RAG query_type to pick the retriever."""
     active_query = state.get("rewritten_query") or state.get("query")
-    query_type = state.get("query_type", "complex")
-    
-    # 2. Track loop telemetry
+    query_type = state.get("query_type", "complex") # Set by rag_router_node
     current_attempts = state.get("retrieval_attempts", 0) + 1
     
-    # 3. Handle bypass conditions
-    if state.get("final_status") == "guardrail_blocked":
-        return {}
-    
-    if query_type == "email":
-        # Email queries generally don't need policy retrieval
-        return {
-            "documents": [],
-            "retrieval_attempts": current_attempts,
-            "retrieval_failure_reason": "Skipped (Email Routing)"
-        }
-
-    # 4. Adaptive Retrieval Execution
     try:
-        # If we are in a correction loop (attempts > 1), force the complex retriever
         if query_type == "simple" and current_attempts == 1:
             retriever = get_simple_retriever()
         else:
             retriever = get_complex_retriever()
             
-        # We use invoke (synchronous block) because HuggingFaceCrossEncoder is CPU bound
-        # In a fully async production environment, this should be wrapped in run_in_executor
         docs = retriever.invoke(active_query)
-        
-        return {
-            "documents": docs,
-            "retrieval_attempts": current_attempts,
-            "retrieval_failure_reason": None
-        }
-        
+        return {"documents": docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
     except Exception as e:
-        print(f"[Retrieval Error] Failed to retrieve context: {e}")
-        return {
-            "documents": [],
-            "retrieval_attempts": current_attempts,
-            "retrieval_failure_reason": f"System Error: {str(e)}"
-        }
+        return {"documents": [], "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
 
-# ==========================================
-# CRAG Nodes
-# ==========================================
-
-async def document_grader_node(state: AgentState) -> dict:
-    """
-    Corrective RAG (CRAG) Grader.
-    Evaluates whether the retrieved documents actually answer the user's query.
-    """
+    
+async def document_grader_node(state: RAGState) -> dict:
     active_query = state.get("rewritten_query") or state.get("query")
     documents = state.get("documents", [])
     
-    # Fast-fail: If retrieval found absolutely nothing
     if not documents:
-        return {
-            "documents_relevant": False,
-            "retrieval_grade_reason": "Retrieval returned 0 chunks."
-        }
+        return {"documents_relevant": False, "retrieval_grade_reason": "Retrieval returned 0 chunks."}
 
-    # Format the context for the LLM judge
     context = "\n\n".join([f"--- Chunk {i+1} ---\n{doc.page_content}" for i, doc in enumerate(documents)])
-    
-    prompt = f"""You are a strict grading evaluator for an HR system.
-Your job is to determine if the retrieved context contains sufficient information to answer the query.
-
+    prompt = f"""You are a strict grading evaluator. Does the context contain info to answer the query?
 Query: "{active_query}"
+Context:\n{context}"""
 
-Retrieved Context:
-{context}
-
-If the context contains the answer (even partially), mark is_relevant as true.
-If the context is completely unrelated or insufficient, mark is_relevant as false.
-"""
-
-    structured_llm = llm.with_structured_output(DocumentGraderResult)
-    
+    structured_llm = fast_llm.with_structured_output(DocumentGraderResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-        return {
-            "documents_relevant": result.is_relevant,
-            "retrieval_grade_reason": result.reason
-        }
-    except Exception as e:
-        print(f"[Grader Error] {e}")
-        # Fail-open if the LLM crashes so we don't get stuck in a loop
-        return {
-            "documents_relevant": True, 
-            "retrieval_grade_reason": "Grader failed, assuming relevant to proceed."
-        }
+        return {"documents_relevant": result.is_relevant, "retrieval_grade_reason": result.reason}
+    except Exception:
+        return {"documents_relevant": True, "retrieval_grade_reason": "Fallback."}
 
 
-async def rewrite_query_node(state: AgentState) -> dict:
-    """
-    CRAG Query Rewriter.
-    If the documents were insufficient, this node rewrites the query for a better retrieval attempt.
-    """
+async def rewrite_query_node(state: RAGState) -> dict:
     original_query = state.get("query")
     previous_rewrites = state.get("rewritten_query", "None")
-    failure_reason = state.get("retrieval_grade_reason", "Insufficient context.")
     
-    prompt = f"""You are an expert search query optimizer for an HR vector database.
-The previous search failed to find the right documents.
-
-Original User Query: "{original_query}"
-Previous Search Query Used: "{previous_rewrites}"
+    # [FIX 2]: Dynamically grab the failure reason from either the Grader or the Reflection node
+    failure_reason = state.get("reflection_reason") or state.get("retrieval_grade_reason") or "Insufficient context."
+    
+    prompt = f"""You are a search query optimizer. The previous search failed.
+Original Query: "{original_query}"
+Previous Search: "{previous_rewrites}"
 Why it failed: "{failure_reason}"
 
-Rewrite the query to be highly optimized for a vector database. Use formal corporate HR terminology. Do not answer the question, just provide the new search string.
+Rewrite the query to be highly optimized for a vector database. Focus specifically on extracting terms that address the failure reason. Do not answer the question.
 """
 
-    structured_llm = llm.with_structured_output(RewriteResult)
-    
+    structured_llm = fast_llm.with_structured_output(RewriteResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-        return {
-            "rewritten_query": result.rewritten_query,
-            "correction_reason": f"Rewrote query because: {failure_reason}"
-        }
-    except Exception as e:
-        print(f"[Rewrite Error] {e}")
-        return {
-            "rewritten_query": original_query,
-            "correction_reason": "Rewrite failed, falling back to original query."
-        }
-    
-# ==========================================
-# Self-Reflection Nodes
-# ==========================================
+        return {"rewritten_query": result.rewritten_query, "correction_reason": failure_reason}
+    except Exception:
+        return {"rewritten_query": original_query, "correction_reason": "Fallback."}
 
-async def generation_node(state: AgentState) -> dict:
-    """
-    Generation Node.
-    Synthesizes the answer and appends it to the chat messages.
-    """
-    query = state.get("rewritten_query") or state.get("query")
+
+async def generation_node(state: RAGState) -> dict:
+    user_query = state.get("query") 
     docs = state.get("documents", [])
-    
     context = "\n\n".join([doc.page_content for doc in docs])
     
-    prompt = f"""You are a helpful HR assistant. Answer the user query using ONLY the provided context.
-If the answer is not in the context, state that clearly. Do not use external knowledge.
+    prompt = f"""You are the official NextBridge HR AI Assistant. 
+Answer the user's question accurately using ONLY the provided HR documents.
+DO NOT narrate your internal process. Speak directly to the user.
 
-Query: "{query}"
-
-Context:
+User Question: "{user_query}"
+HR Documents:
 {context}
-
 Answer:"""
-    
-    response = await llm.ainvoke([HumanMessage(content=prompt)])
-    
-    return {
-        "generation": response.content,
-        "generation_attempts": state.get("generation_attempts", 0) + 1,
-        "messages": [AIMessage(content=response.content)] # <--- ADDED THIS LINE
-    }
+    # USE PRIMARY LLM (Needs advanced language skills to synthesize HR policies)
+    response = await primary_llm.ainvoke([HumanMessage(content=prompt)])
+    return {"generation": response.content, "generation_attempts": state.get("generation_attempts", 0) + 1}
 
 
-async def reflection_node(state: AgentState) -> dict:
-    """
-    Self-RAG Reflection (Upgraded).
-    Critiques the generated answer and determines the exact root cause of hallucinations.
-    """
-    active_query = state.get("rewritten_query") or state.get("query")
+async def reflection_node(state: RAGState) -> dict:
+    user_query = state.get("query") 
     generation = state.get("generation")
     docs = state.get("documents", [])
     context = "\n\n".join([doc.page_content for doc in docs])
     
-    prompt = f"""You are a strict hallucination grader. 
-Evaluate the generated answer against the retrieved context.
-
-Query: "{active_query}"
+    prompt = f"""You are a strict hallucination grader. Evaluate the answer against the context.
+Query: "{user_query}"
 Answer: "{generation}"
-
-Context:
-{context}
+Context:\n{context}
 
 RULES:
-1. If the answer is completely supported by the Context, set is_grounded=True and error_type="none".
-2. If the answer contains facts NOT in the context, set is_grounded=False.
-3. If is_grounded=False, determine WHY:
-   - If the Context actually lacks the information needed to answer the query, set error_type="missing_evidence".
-   - If the Context HAS the information, but the Answer just brought in extra outside knowledge, set error_type="wording_problem".
+1. If supported, is_grounded=True, error_type="none".
+2. If facts missing from context, is_grounded=False.
+3. If False: "missing_evidence" (context lacks facts) or "wording_problem" (answer brought outside knowledge).
 """
-    
-    structured_llm = llm.with_structured_output(ReflectionResult)
-    
+    # USE PRIMARY LLM (Needs advanced reasoning to detect complex hallucinations)
+    structured_llm = primary_llm.with_structured_output(ReflectionResult)
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-        return {
-            "answer_grounded": result.is_grounded,
-            "reflection_error_type": result.error_type,
-            "reflection_reason": result.reason
-        }
+        return {"answer_grounded": result.is_grounded, "reflection_error_type": result.error_type, "reflection_reason": result.reason}
     except Exception as e:
-        return {
-            "answer_grounded": True, 
-            "reflection_error_type": "none",
-            "reflection_reason": f"Reflection failed: {e}"
-        }
+        return {"answer_grounded": True, "reflection_error_type": "none", "reflection_reason": str(e)}

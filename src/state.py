@@ -1,13 +1,7 @@
 """
-LangGraph state schema for the NextBridge HR Agent.
-
-Tracks:
-- Conversation/tool state
-- Adaptive query routing
-- CRAG retrieval and grading
-- Query rewriting
-- Self-RAG generation/reflection
-- Correction-loop telemetry
+LangGraph state schemas for the NextBridge HR Agent.
+Implements the Multi-Agent Hierarchical Pattern by isolating 
+lightweight orchestration state from heavy RAG logic state.
 """
 
 from typing import Annotated, TypedDict, Optional, List, Dict
@@ -16,81 +10,54 @@ from langchain_core.documents import Document
 from langgraph.graph.message import add_messages
 
 
-class AgentState(TypedDict):
-    """Shared state for the HR Agent LangGraph workflow."""
-
-    # =========================================================
-    # 1. Conversation & Existing Tool State
-    # =========================================================
-
+# =========================================================
+# 1. Parent Graph State (Supervisor)
+# =========================================================
+class SupervisorState(TypedDict):
+    """Ultra-lightweight state for orchestration, conversation history, and HITL."""
+    
     messages: Annotated[List[BaseMessage], add_messages]
 
+    # Email / HITL State (Must persist across checkpoints)
     email_draft: Optional[Dict[str, str]]
     awaiting_approval: bool
 
-    # =========================================================
-    # 2. Query / Routing State
-    # =========================================================
+    # Routing Status
+    query_type: Optional[str]  # e.g., "simple", "complex", "email", "chat"
+    final_status: Optional[str] # e.g., "success", "guardrail_blocked"
 
+
+# =========================================================
+# 2. Child Graph State (CRAG Subgraph)
+# =========================================================
+class RAGState(TypedDict):
+    """Heavy, ephemeral state strictly for the CRAG loop. Destroyed after execution to save memory."""
+    
     query: str
-    query_type: Optional[str]
-    # Examples:
-    # "simple"
-    # "complex"
-    # "email"
+    query_type: str 
+    intent_key: Optional[str]  
     query_variants: List[str]
 
-    # =========================================================
-    # 3. Retrieval State
-    # =========================================================
-
+    # Retrieval State
     documents: List[Document]
-
     retrieval_attempts: int
-
-    # Identifies why the current retrieval was rejected.
     retrieval_failure_reason: Optional[str]
+    # [FIX] Use a dedicated string to overwrite drafts, NOT a list!
+    final_generation: str
 
-    # =========================================================
-    # 4. CRAG Grading State
-    # =========================================================
-
+    # CRAG Grading State
     documents_relevant: bool
-
-    # Optional textual explanation from the grader.
     retrieval_grade_reason: Optional[str]
 
-    # =========================================================
-    # 5. Query Correction State
-    # =========================================================
-
+    # Query Correction State
     rewritten_query: Optional[str]
-
     correction_reason: Optional[str]
 
-    # =========================================================
-    # 6. Generation State
-    # =========================================================
-
+    # Generation State
     generation: Optional[str]
-
     generation_attempts: int
 
-    # =========================================================
-    # 7. Self-RAG Reflection State
-    # =========================================================
-
+    # Self-RAG Reflection State
     answer_grounded: bool
-
+    reflection_error_type: Optional[str]
     reflection_reason: Optional[str]
-
-    # =========================================================
-    # 8. Final Routing / Status
-    # =========================================================
-
-    final_status: Optional[str]
-    # Examples:
-    # "success"
-    # "retrieval_failed"
-    # "generation_failed"
-    # "guardrail_blocked"

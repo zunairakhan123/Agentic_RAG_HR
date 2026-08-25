@@ -27,26 +27,25 @@ DEPARTMENT_DIRECTORY: Dict[str, str] = {
 
 @tool
 def guardrailed_web_search(query: str) -> str:
-    """Searches the web for NextBridge software company information ONLY.
-    Guardrail enforces rejection of fashion, entertainment, or irrelevant general queries.
     """
-    nextbridge_keywords = ["nextbridge", "software", "lahore", "tech", "it company", "hrm"]
-    is_relevant = any(kw in query.lower() for kw in nextbridge_keywords)
-
-    if not is_relevant:
-        return (
-            "GUARDRAIL_BLOCKED: I am authorized to search the internet strictly for "
-            "NextBridge-related information or software development contexts. "
-            "I cannot assist with general topics, fashion, or external entertainment events."
-        )
-
+    Searches the web for Nextbridge company information.
+    """
     try:
-        search_engine = TavilySearchResults(max_results=3)
-        results = search_engine.invoke(query)
+        # [PRODUCTION FIX]: Programmatic Entity Scoping
+        # Force the search engine to look for the software company, not the oil company.
+        scoped_query = f"{query} Nextbridge software IT company Pakistan Lahore"
+        
+        search_engine = TavilySearchResults(max_results=4)
+        results = search_engine.invoke(scoped_query)
+        
+        if not results or len(results) == 0:
+            return "Search completed, but no relevant public information was found."
+            
         return str(results)
+        
     except Exception as err:
+        print(f"[Tavily Search Error] {err}")
         return f"Web search failed: {str(err)}"
-
 
 @tool
 def draft_department_email(department: str, subject: str, body: str) -> str:

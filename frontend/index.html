@@ -43,17 +43,18 @@
         /* Microphone Button Styling */
         .mic-btn { 
             background: #fff; 
-            border: 1px solid #ccc; 
+            border: 1px solid #b2afaf; 
             border-radius: 6px; 
             cursor: pointer; 
             padding: 0 15px; 
             font-size: 1.2rem; 
+            color: #333;
             transition: 0.2s ease;
             display: flex;
             align-items: center;
             justify-content: center;
         }
-        .mic-btn:hover { background: #eee; }
+        .mic-btn:hover { background: #787676; }
         
         /* Active Recording State */
         .mic-btn.recording { 
@@ -185,6 +186,10 @@
                         if(parsed.type === 'token') {
                             fullResponse += parsed.content;
                             textSpan.innerHTML = marked.parse(fullResponse);
+                        // [NEW FIX]: Wipe the accumulated text for Self-RAG corrections
+                        } else if (parsed.type === 'clear') {
+                            fullResponse = ""; // Empty the buffer
+                            textSpan.innerHTML = `<span class="tool-indicator">Wait, reviewing HR policies to refine this answer...</span>`;
                         } else if(parsed.type === 'tool_start') {
                             // Show tool execution indicator if no text has been generated yet
                             if (!fullResponse) {
