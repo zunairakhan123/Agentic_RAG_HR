@@ -47,7 +47,7 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
 ---
 
 ## System Architecture (Super-Graph)
-
+```
                           ┌─────────────────────────┐
                           │     Frontend / Client   │
                           │ (Chat UI / Voice Mode)  │
@@ -112,6 +112,7 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
                                                       │ [Regenerate]                 [ END ]   │
                                                       │       │                                │
                                                       └───────┴────────────────────────────────┘
+
 ```
 
 ---
