@@ -1,4 +1,3 @@
-
 """
 LangGraph nodes for the NextBridge HR Agent.
 Contains the Guardrail and Adaptive Router logic using Pydantic structured outputs.
@@ -66,6 +65,7 @@ class ReflectionResult(BaseModel):
 
 async def input_guardrail_node(state: SupervisorState) -> dict:
     user_query = state["messages"][-1].content
+    print(f"\n{'-'*50}\n[GUARDRAIL] Evaluating input: '{user_query}'")
     
     last_ai_message = ""
     for msg in reversed(state["messages"][:-1]):  
@@ -85,7 +85,7 @@ async def input_guardrail_node(state: SupervisorState) -> dict:
     2. Office Perks & Operations: Meal subscriptions, seating, IT requests, or facility management.
     3. Departmental Routing: Mentions of specific departments (MIS, HR, MEAL, ADMIN).
     4. NextBridge Info: Questions about the software company, CEO,personal staff information, or locations .
-    5. General Policies: Questions about any company policies, employee handbooks, or internal guidelines.
+    5. General Policies: Questions about any company policies, employee handbooks,forms or internal guidelines.
     6. Casual Chat: Greetings, thanks, or general conversation.
     
     BLOCKED (Return "block"):
@@ -104,10 +104,13 @@ Latest User Query: "{user_query}"
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
         if not result.is_valid:
+            print(f"[GUARDRAIL] Status: BLOCKED | Reason: {result.reason}")
             fallback = f"I am strictly a NextBridge HR Assistant. I cannot assist with this query. (Reason: {result.reason})"
             return {"final_status": "guardrail_blocked", "messages": [AIMessage(content=fallback)]}
+        print("[GUARDRAIL] Status: PASSED")
         return {"final_status": "processing"}
     except Exception:
+        print("[GUARDRAIL] Warning: Parsing failed. Defaulting to PASSED.")
         return {"final_status": "processing"}
 
 
@@ -134,9 +137,10 @@ async def adaptive_router_node(state: SupervisorState) -> dict:
     structured_llm = fast_llm.with_structured_output(SupervisorRouterResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        print(f"[SUPERVISOR ROUTER] Selected Category: '{result.category}'")
         return {"query_type": result.category}
     except Exception as e:
-        print(f"[Router Warning] Parsing failed, defaulting to 'chat'. Error: {e}")
+        print(f"[SUPERVISOR ROUTER] Warning: Parsing failed, defaulting to 'chat'. Error: {e}")
         # Default to chat for short/confusing queries to prevent heavy RAG/Web executions
         return {"query_type": "chat"}
 
@@ -158,11 +162,13 @@ async def rag_router_node(state: RAGState) -> dict:
     structured_llm = fast_llm.with_structured_output(RAGRouterResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        print(f"[RAG ROUTER] Type: '{result.category.upper()}' | Intent Key: '{result.intent_key}'")
         return {
             "query_type": result.category,
             "intent_key": result.intent_key  # Save the semantic key
         }
     except Exception:
+        print("[RAG ROUTER] Warning: Parsing failed. Defaulting to 'COMPLEX'.")
         return {"query_type": "complex", "intent_key": "unknown_complex"}
 
 async def retrieval_node(state: RAGState) -> dict:
@@ -171,6 +177,9 @@ async def retrieval_node(state: RAGState) -> dict:
     query_type = state.get("query_type", "complex") # Set by rag_router_node
     current_attempts = state.get("retrieval_attempts", 0) + 1
     
+    print(f"\n[RETRIEVAL NODE] Attempt #{current_attempts} | Mode: {query_type.upper()}")
+    print(f"[RETRIEVAL NODE] Active Query: '{active_query}'")
+    
     try:
         if query_type == "simple" and current_attempts == 1:
             retriever = get_simple_retriever()
@@ -178,8 +187,17 @@ async def retrieval_node(state: RAGState) -> dict:
             retriever = get_complex_retriever()
             
         docs = retriever.invoke(active_query)
+        print(f"[RETRIEVAL NODE] Successfully retrieved {len(docs)} documents.")
+        
+        # Print a short snippet of up to 3 docs for terminal clarity
+        for i, doc in enumerate(docs[:3], 1):
+            source = doc.metadata.get('source', 'unknown')
+            snippet = doc.page_content.replace('\n', ' ')[:75]
+            print(f"  Doc {i} [{source}]: {snippet}...")
+            
         return {"documents": docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
     except Exception as e:
+        print(f"[RETRIEVAL NODE] Error during retrieval: {e}")
         return {"documents": [], "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
 
     
@@ -187,7 +205,9 @@ async def document_grader_node(state: RAGState) -> dict:
     active_query = state.get("rewritten_query") or state.get("query")
     documents = state.get("documents", [])
     
+    print(f"\n[DOCUMENT GRADER] Grading {len(documents)} retrieved chunks...")
     if not documents:
+        print("[DOCUMENT GRADER] Result: NOT RELEVANT | Reason: 0 chunks retrieved.")
         return {"documents_relevant": False, "retrieval_grade_reason": "Retrieval returned 0 chunks."}
 
     context = "\n\n".join([f"--- Chunk {i+1} ---\n{doc.page_content}" for i, doc in enumerate(documents)])
@@ -198,8 +218,11 @@ Context:\n{context}"""
     structured_llm = fast_llm.with_structured_output(DocumentGraderResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        status_str = "RELEVANT" if result.is_relevant else "NOT RELEVANT"
+        print(f"[DOCUMENT GRADER] Result: {status_str} | Reason: {result.reason}")
         return {"documents_relevant": result.is_relevant, "retrieval_grade_reason": result.reason}
     except Exception:
+        print("[DOCUMENT GRADER] Warning: Parsing failed. Assumed RELEVANT.")
         return {"documents_relevant": True, "retrieval_grade_reason": "Fallback."}
 
 
@@ -209,6 +232,9 @@ async def rewrite_query_node(state: RAGState) -> dict:
     
     # [FIX 2]: Dynamically grab the failure reason from either the Grader or the Reflection node
     failure_reason = state.get("reflection_reason") or state.get("retrieval_grade_reason") or "Insufficient context."
+    
+    print(f"\n[REWRITE QUERY NODE] Optimizing query...")
+    print(f"[REWRITE QUERY NODE] Addressing failure: '{failure_reason}'")
     
     prompt = f"""You are a search query optimizer. The previous search failed.
 Original Query: "{original_query}"
@@ -221,34 +247,49 @@ Rewrite the query to be highly optimized for a vector database. Focus specifical
     structured_llm = fast_llm.with_structured_output(RewriteResult, method="json_schema")
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        print(f"[REWRITE QUERY NODE] New Rewritten Query: '{result.rewritten_query}'")
         return {"rewritten_query": result.rewritten_query, "correction_reason": failure_reason}
     except Exception:
+        print(f"[REWRITE QUERY NODE] Warning: Parsing failed. Returning original query.")
         return {"rewritten_query": original_query, "correction_reason": "Fallback."}
 
 
 async def generation_node(state: RAGState) -> dict:
     user_query = state.get("query") 
     docs = state.get("documents", [])
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join([f"--- Source Excerpt {i+1} ---\n{doc.page_content}" for i, doc in enumerate(docs)])
     
+    attempt = state.get("generation_attempts", 0) + 1
+    print(f"\n[GENERATION NODE] Synthesizing response (Attempt #{attempt})...")
+    
+    # [FIXED PROMPT]: Forcing systematic breakdown for multi-questions
     prompt = f"""You are the official NextBridge HR AI Assistant. 
 Answer the user's question accurately using ONLY the provided HR documents.
-DO NOT narrate your internal process. Speak directly to the user.
 
 User Question: "{user_query}"
+
 HR Documents:
 {context}
-Answer:"""
-    # USE PRIMARY LLM (Needs advanced language skills to synthesize HR policies)
-    response = await primary_llm.ainvoke([HumanMessage(content=prompt)])
-    return {"generation": response.content, "generation_attempts": state.get("generation_attempts", 0) + 1}
 
+CRITICAL GENERATION RULES:
+1. If the user asks multiple distinct questions, you MUST address EACH question separately using clear bullet points or headers.
+2. If the provided documents do not contain information for a specific part of the query, explicitly state: "The documents do not specify [topic]."
+3. DO NOT narrate your internal process. Speak directly to the user.
+4. If the extracted information contains tabular data, limits, or form fields, you MUST format the output using proper Markdown tables or structured lists to preserve readability.
+
+Answer:"""
+    
+    response = await primary_llm.ainvoke([HumanMessage(content=prompt)])
+    print("[GENERATION NODE] Generation complete.")
+    return {"generation": response.content, "generation_attempts": attempt}
 
 async def reflection_node(state: RAGState) -> dict:
     user_query = state.get("query") 
     generation = state.get("generation")
     docs = state.get("documents", [])
     context = "\n\n".join([doc.page_content for doc in docs])
+    
+    print(f"\n[REFLECTION NODE] Verifying grounding against context...")
     
     prompt = f"""You are a strict hallucination grader. Evaluate the answer against the context.
 Query: "{user_query}"
@@ -264,6 +305,9 @@ RULES:
     structured_llm = primary_llm.with_structured_output(ReflectionResult)
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        status = "GROUNDED" if result.is_grounded else f"UNGROUNDED ({result.error_type})"
+        print(f"[REFLECTION NODE] Result: {status} | Reason: {result.reason}")
         return {"answer_grounded": result.is_grounded, "reflection_error_type": result.error_type, "reflection_reason": result.reason}
     except Exception as e:
+        print(f"[REFLECTION NODE] Warning: Parsing failed. Assumed GROUNDED. Error: {e}")
         return {"answer_grounded": True, "reflection_error_type": "none", "reflection_reason": str(e)}

@@ -88,7 +88,6 @@ async def agent_node(state: SupervisorState):
     trimmed = trim_messages(state["messages"], max_tokens=12, strategy="last", token_counter=len, start_on="human")
     messages = [system_instruction] + trimmed
     
-    # ... inside agent_node ...
     if active_tools:
         specialized_llm = llm.bind_tools(active_tools).with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
     else:

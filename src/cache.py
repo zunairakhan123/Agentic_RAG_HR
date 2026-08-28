@@ -1,62 +1,61 @@
 """
 Frequency-Based Semantic Cache and CI/CD Data Pipeline Generator.
+Uses Two-Tiered LLM-Evaluated Caching (The Production Standard).
 """
 import os
 import json
-import asyncio
-import hashlib
+import uuid
 import aiosqlite
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage
+from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
 from src.ingestion import get_embedding_function
 
 # ==========================================
-# 1. Constants & Paths
+# 1. Constants & Setup
 # ==========================================
 CACHE_DIR = os.path.join("data", "semantic_cache")
+TRACKER_DIR = os.path.join("data", "semantic_tracker") 
 DB_PATH = os.path.join("data", "semantic_cache", "frequency.db")
 EVAL_DATASET_PATH = os.path.join("evaluation", "datasets", "promoted_cache_queries.json")
 PROMOTION_THRESHOLD = 3
 
-# ==========================================
-# 2. Database Initializations
-# ==========================================
-query_cache = Chroma(
-    persist_directory=CACHE_DIR,
-    embedding_function=get_embedding_function()
+embed_fn = get_embedding_function()
+collection_config = {"hnsw:space": "cosine"}
+
+query_cache = Chroma(persist_directory=CACHE_DIR, embedding_function=embed_fn, collection_metadata=collection_config)
+tracker_cache = Chroma(persist_directory=TRACKER_DIR, embedding_function=embed_fn, collection_metadata=collection_config)
+
+# Initialize Fast LLM for the Cache Judge
+fast_llm = ChatGroq(
+    api_key=os.getenv("GROQ_API_KEY"),
+    model="openai/gpt-oss-120b",
+    temperature=0.0
 )
 
+class CacheEquivalence(BaseModel):
+    is_same: bool = Field(description="True if the queries ask for the exact same core information, False otherwise.")
+
 async def init_frequency_db():
-    """Initializes the persistent SQLite tracker."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS query_frequency (hash TEXT PRIMARY KEY, count INTEGER)"
-        )
+        await db.execute("CREATE TABLE IF NOT EXISTS query_frequency (hash TEXT PRIMARY KEY, count INTEGER)")
         await db.commit()
 
 # ==========================================
-# 3. Helper Functions
+# 2. Helper Functions
 # ==========================================
-def get_query_hash(query: str) -> str:
-    """Normalizes and hashes the query for exact-match frequency tracking."""
-    return hashlib.md5(query.lower().strip().encode()).hexdigest()
-
-def check_semantic_cache(query: str, similarity_threshold: float = 0.15) -> str:
-    """Fast-path Read Phase."""
+def check_semantic_cache(query: str) -> str:
+    """Read phase: Strict match required for instant retrieval."""
     results = query_cache.similarity_search_with_score(query, k=1)
-    if results:
-        best_match, distance = results[0]
-        if distance <= similarity_threshold:
-            print(f"[CACHE HIT] Dist: {distance:.2f}")
-            return best_match.metadata.get("answer")
+    if results and (1.0 - results[0][1]) >= 0.90:  # 90% threshold for instant delivery
+        return results[0][0].metadata.get("answer")
     return None
 
 def save_to_semantic_cache(query: str, answer: str):
-    """Saves to ChromaDB and exports to the CI/CD JSON evaluation pipeline."""
     query_cache.add_texts(texts=[query], metadatas=[{"answer": answer}])
-    
     os.makedirs(os.path.dirname(EVAL_DATASET_PATH), exist_ok=True)
-    eval_entry = {"question": query, "ground_truth": answer}
     
     try:
         data = []
@@ -64,7 +63,7 @@ def save_to_semantic_cache(query: str, answer: str):
             with open(EVAL_DATASET_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
         
-        data.append(eval_entry)
+        data.append({"question": query, "ground_truth": answer})
         
         with open(EVAL_DATASET_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
@@ -72,36 +71,56 @@ def save_to_semantic_cache(query: str, answer: str):
         print(f"[Pipeline Error] Failed to write eval JSON: {e}")
 
 # ==========================================
-# 4. Main Promotion Logic
+# 3. Main Promotion Logic (LLM Judge)
 # ==========================================
 async def track_and_promote(query: str, answer: str, rag_state: dict):
-    retrieval_attempts = rag_state.get("retrieval_attempts", 0)
-    is_grounded = rag_state.get("answer_grounded", False)
-    is_simple = rag_state.get("query_type") == "simple"
-
-    if retrieval_attempts == 0 or not (is_grounded or is_simple):
+    if rag_state.get("retrieval_attempts", 0) == 0 or not (rag_state.get("answer_grounded") or rag_state.get("query_type") == "simple"):
         return
 
-    # [THE UPGRADE]: Use the LLM's normalized intent instead of the raw query!
-    semantic_intent = rag_state.get("intent_key", query)
+    # STEP 1: Broad Vector Search (Relaxed to 65% to catch acronyms and rewrites)
+    results = tracker_cache.similarity_search_with_score(query, k=1)
     
-    # Hash the normalized intent (e.g., "sick_leave_policy" always hashes to the same ID)
-    q_hash = get_query_hash(semantic_intent)
-    
+    q_hash = None
+    if results:
+        closest_q = results[0][0].page_content
+        cosine_similarity = 1.0 - results[0][1]
+        
+        if cosine_similarity >= 0.65:
+            # STEP 2: The LLM Judge determines true equivalence
+            prompt = f"""Are these two user queries asking for the exact same HR information?
+            Query 1: "{query}"
+            Query 2: "{closest_q}"
+            
+            Ignore typos, acronyms (like OPD vs Outpatient), or filler words. Focus only on the core intent.
+            """
+            try:
+                structured_llm = fast_llm.with_structured_output(CacheEquivalence, method="json_schema")
+                judge_result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+                
+                if judge_result.is_same:
+                    q_hash = results[0][0].metadata.get("tracking_id")
+                    print(f"  -> [TRACKER HIT] LLM verified equivalence with: '{closest_q}'")
+                else:
+                    print(f"  -> [TRACKER MISS] LLM rejected equivalence with: '{closest_q}'")
+            except Exception as e:
+                print(f"  -> [TRACKER WARNING] LLM Judge failed: {e}")
+
+    # STEP 3: Assign new hash if no match was found/verified
+    if not q_hash:
+        q_hash = str(uuid.uuid4())
+        tracker_cache.add_texts(texts=[query], metadatas=[{"tracking_id": q_hash}])
+
+    # Update SQLite Tracker
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT count FROM query_frequency WHERE hash = ?", (q_hash,)) as cursor:
             row = await cursor.fetchone()
             current_count = row[0] if row else 0
             
         new_count = current_count + 1
-        
-        await db.execute(
-            "INSERT OR REPLACE INTO query_frequency (hash, count) VALUES (?, ?)", 
-            (q_hash, new_count)
-        )
+        await db.execute("INSERT OR REPLACE INTO query_frequency (hash, count) VALUES (?, ?)", (q_hash, new_count))
         await db.commit()
     
-    print(f"  -> [Telemetry] Query '{query}' frequency: {new_count}/{PROMOTION_THRESHOLD}")
+    print(f"  -> [Telemetry] Intent Frequency: {new_count}/{PROMOTION_THRESHOLD}")
     
     if new_count == PROMOTION_THRESHOLD:
         save_to_semantic_cache(query, answer)
