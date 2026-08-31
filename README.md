@@ -124,7 +124,6 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
 Retrieval is split into an isolated, cyclic child graph featuring an adaptive dual-pipeline:
 
 - **Map-Reduce Parallel Retrieval:** The complex pathway dynamically breaks multi-intent questions into semantic sub-queries. It executes concurrent hybrid searches and isolates Cross-Encoder re-ranking per topic, preventing chunk starvation on compound inputs.
-- **Full Context Hydration:** Automatically hydrates complete physical pages from disk when forms or tables are retrieved, guaranteeing zero truncation across ChromaDB chunk boundaries.
 - **Resilient Self-Correction:** Evaluates retrieved chunk relevance, rewrites poor retrieval queries, and self-checks generated answers against context using a strict output reflection guardrail.
 
 ### 2. Programmatic Entity Scoping (Anti-Hallucination)
