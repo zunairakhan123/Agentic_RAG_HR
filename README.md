@@ -42,7 +42,7 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
 - **Smooth UI Invalidation Protocol:** Emits granular Server-Sent Events (`clear`, `token`, `status`, `tool_start`, `tool_end`) to deliver real-time token streaming and transparent reflection wipes without client-side text-stacking glitches.
 - **Map-Reduce Sub-Query Retrieval:** Decomposes complex, multi-intent questions into isolated parallel vector searches and localized cross-encoder re-ranking. This completely eliminates keyword starvation, cross-encoder penalties, and LLM "generator amnesia" on compound queries.
 - **LLM-Evaluated Semantic Caching:** Replaces naive string hashing with a two-tier Cosine Similarity and LLM-as-a-Judge caching system. Accurately merges acronyms and rephrasings (e.g., "OPD" vs "Outpatient") for tracking, while maintaining strict 90% semantic thresholds for instant cache delivery.
-- **Dynamic Context Hydration:** Intelligently intercepts chunk boundary limitations by hydrating complete source pages directly from disk, ensuring complex tabular data and HR forms are perfectly reconstructed in Markdown.
+
 
 ---
 
