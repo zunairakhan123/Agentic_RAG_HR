@@ -65,9 +65,11 @@ class SubQueryComplexRetriever:
     def invoke(self, query: str) -> list:
         # 1. Decompose the multi-part question
         prompt = f"""Break down the user's input into separate, standalone search queries for an HR database.
-        - If it contains multiple questions/topics, generate a standalone query for each topic.
+        - Split compound questions into separate standalone queries (1 query per distinct topic).
+        - Preserve acronyms and entities exactly as provided by the user (do not arbitrarily change or translate acronyms).
+        - Use broad, descriptive domain terminology where appropriate to maximize search hits.  
         - If it is a single question, return a list with just that one query.
-        - Maximum 3 sub-queries. Fix any typos (e.g. 'anual' -> 'annual').
+        - Maximum 10 sub-queries. Fix any typos (e.g. 'anual' -> 'annual').
 
         User Query: "{query}"
         
@@ -142,8 +144,8 @@ def get_complex_retriever():
     )
     
     cross_encoder = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-    # Take top 3 documents PER sub-query (Total max 9 docs for a 3-part question)
-    compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
+    # Take top 5 documents PER sub-query (Total max 50 docs for a 10-part question)
+    compressor = CrossEncoderReranker(model=cross_encoder, top_n=5)
 
     # Return our custom wrapper class that perfectly mimics LangChain's .invoke()
     _COMPLEX_RETRIEVER_CACHE = SubQueryComplexRetriever(

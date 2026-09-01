@@ -172,7 +172,7 @@ async def rag_router_node(state: RAGState) -> dict:
         return {"query_type": "complex", "intent_key": "unknown_complex"}
 
 async def retrieval_node(state: RAGState) -> dict:
-    """Uses the RAG query_type to pick the retriever."""
+    """Uses the RAG query_type to pick the retriever and accumulates documents."""
     active_query = state.get("rewritten_query") or state.get("query")
     query_type = state.get("query_type", "complex") # Set by rag_router_node
     current_attempts = state.get("retrieval_attempts", 0) + 1
@@ -186,19 +186,32 @@ async def retrieval_node(state: RAGState) -> dict:
         else:
             retriever = get_complex_retriever()
             
-        docs = retriever.invoke(active_query)
-        print(f"[RETRIEVAL NODE] Successfully retrieved {len(docs)} documents.")
+        new_docs = retriever.invoke(active_query)
+        
+        # [PRODUCTION FIX]: Accumulate and deduplicate across retry/rewrite loops
+        existing_docs = state.get("documents", []) or []
+        seen_contents = {doc.page_content for doc in existing_docs}
+        
+        combined_docs = list(existing_docs)
+        for doc in new_docs:
+            if doc.page_content not in seen_contents:
+                seen_contents.add(doc.page_content)
+                combined_docs.append(doc)
+
+        print(f"[RETRIEVAL NODE] Total accumulated unique documents in state: {len(combined_docs)}")
         
         # Print a short snippet of up to 3 docs for terminal clarity
-        for i, doc in enumerate(docs[:3], 1):
+        for i, doc in enumerate(combined_docs[:3], 1):
             source = doc.metadata.get('source', 'unknown')
             snippet = doc.page_content.replace('\n', ' ')[:75]
             print(f"  Doc {i} [{source}]: {snippet}...")
             
-        return {"documents": docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
+        return {"documents": combined_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
     except Exception as e:
         print(f"[RETRIEVAL NODE] Error during retrieval: {e}")
-        return {"documents": [], "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
+        # Return existing docs so we don't lose them on a crash!
+        existing_docs = state.get("documents", []) or []
+        return {"documents": existing_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
 
     
 async def document_grader_node(state: RAGState) -> dict:
@@ -211,7 +224,14 @@ async def document_grader_node(state: RAGState) -> dict:
         return {"documents_relevant": False, "retrieval_grade_reason": "Retrieval returned 0 chunks."}
 
     context = "\n\n".join([f"--- Chunk {i+1} ---\n{doc.page_content}" for i, doc in enumerate(documents)])
-    prompt = f"""You are a strict grading evaluator. Does the context contain info to answer the query?
+    prompt = f"""You are an expert retrieval evaluator.
+Evaluate if the retrieved context contains relevant information to answer all or substantial parts of the user query.
+
+Strict Rules for Relevance:
+1. Partial Matches are Valid: If the query contains multiple questions (e.g., A, B, and C), and the context answers AT LEAST ONE of them, you MUST mark is_relevant = True. The generator will handle the missing parts.
+2. Semantic Synonyms: Corporate documents use varied nomenclature (e.g., "Panel" vs "Reimbursable", "Entitlement" vs "Allowance"). If the context discusses the core concept, it is relevant.
+3. Rejection Criteria: ONLY mark is_relevant = False if the retrieved documents are completely unrelated, off-topic, or contain zero useful facts for ANY part of the query.
+
 Query: "{active_query}"
 Context:\n{context}"""
 
@@ -274,7 +294,7 @@ HR Documents:
 CRITICAL GENERATION RULES:
 1. If the user asks multiple distinct questions, you MUST address EACH question separately using clear bullet points or headers.
 2. If the provided documents do not contain information for a specific part of the query, explicitly state: "The documents do not specify [topic]."
-3. DO NOT narrate your internal process. Speak directly to the user.
+3. DO NOT narrate your internal process (e.g. "Based on the documents provided..."). Speak directly to the user.
 4. If the extracted information contains tabular data, limits, or form fields, you MUST format the output using proper Markdown tables or structured lists to preserve readability.
 
 Answer:"""

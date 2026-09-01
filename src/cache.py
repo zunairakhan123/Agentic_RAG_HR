@@ -1,10 +1,11 @@
 """
 Frequency-Based Semantic Cache and CI/CD Data Pipeline Generator.
-Uses Two-Tiered LLM-Evaluated Caching (The Production Standard).
+Uses Two-Tiered LLM-Evaluated Caching with TTL(time-to-live) Expiration.
 """
 import os
 import json
 import uuid
+import time
 import aiosqlite
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
@@ -19,7 +20,10 @@ CACHE_DIR = os.path.join("data", "semantic_cache")
 TRACKER_DIR = os.path.join("data", "semantic_tracker") 
 DB_PATH = os.path.join("data", "semantic_cache", "frequency.db")
 EVAL_DATASET_PATH = os.path.join("evaluation", "datasets", "promoted_cache_queries.json")
+
 PROMOTION_THRESHOLD = 3
+CACHE_TTL_DAYS = 20
+CACHE_TTL_SECONDS = CACHE_TTL_DAYS * 24 * 60 * 60
 
 embed_fn = get_embedding_function()
 collection_config = {"hnsw:space": "cosine"}
@@ -44,19 +48,56 @@ async def init_frequency_db():
         await db.commit()
 
 # ==========================================
-# 2. Helper Functions
+# 2. TTL Cleanup & Maintenance
 # ==========================================
-def check_semantic_cache(query: str) -> str:
-    """Read phase: Strict match required for instant retrieval."""
+def prune_expired_cache():
+    """
+    Actively deletes expired entries from ChromaDB. 
+    Can be run on server startup or triggered via an admin webhook.
+    """
+    expiration_threshold = time.time() - CACHE_TTL_SECONDS
+    try:
+        # Access the underlying Chroma collection to execute a 'where' deletion query
+        query_cache._collection.delete(where={"created_at": {"$lt": expiration_threshold}})
+        print(f"🧹 [CACHE MAINTENANCE] Pruned cache entries older than {CACHE_TTL_DAYS} days.")
+    except Exception as e:
+        print(f"⚠️ [CACHE WARNING] Could not prune cache: {e}")
+
+# ==========================================
+# 3. Cache Read/Write Operations
+# ==========================================
+def check_semantic_cache(query: str, similarity_threshold: float = 0.90) -> str:
+    """Read phase: Checks vector similarity AND timestamp expiration."""
     results = query_cache.similarity_search_with_score(query, k=1)
-    if results and (1.0 - results[0][1]) >= 0.90:  # 90% threshold for instant delivery
-        return results[0][0].metadata.get("answer")
+    
+    if results:
+        best_match, cosine_distance = results[0]
+        cosine_similarity = 1.0 - cosine_distance
+        
+        # [NEW] Extract timestamp and verify TTL
+        created_at = best_match.metadata.get("created_at", 0.0)
+        age_in_seconds = time.time() - created_at
+        is_expired = age_in_seconds > CACHE_TTL_SECONDS
+        
+        if is_expired:
+            print(f"  -> [CACHE EXPIRED] Ignoring stale cache entry (Age: {age_in_seconds / 86400:.1f} days)")
+            return None
+            
+        if cosine_similarity >= similarity_threshold:
+            print(f"⚡ [CACHE HIT] Valid entry found (Similarity: {cosine_similarity:.2f})")
+            return best_match.metadata.get("answer")
+            
     return None
 
 def save_to_semantic_cache(query: str, answer: str):
-    query_cache.add_texts(texts=[query], metadatas=[{"answer": answer}])
-    os.makedirs(os.path.dirname(EVAL_DATASET_PATH), exist_ok=True)
+    """Saves entry with creation timestamp for future TTL checks."""
+    # [NEW] Inject 'created_at' metadata
+    query_cache.add_texts(
+        texts=[query], 
+        metadatas=[{"answer": answer, "created_at": time.time()}]
+    )
     
+    os.makedirs(os.path.dirname(EVAL_DATASET_PATH), exist_ok=True)
     try:
         data = []
         if os.path.exists(EVAL_DATASET_PATH):
@@ -64,20 +105,19 @@ def save_to_semantic_cache(query: str, answer: str):
                 data = json.load(f)
         
         data.append({"question": query, "ground_truth": answer})
-        
         with open(EVAL_DATASET_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
         print(f"[Pipeline Error] Failed to write eval JSON: {e}")
 
 # ==========================================
-# 3. Main Promotion Logic (LLM Judge)
+# 4. Main Tracking Logic (LLM Judge)
 # ==========================================
 async def track_and_promote(query: str, answer: str, rag_state: dict):
     if rag_state.get("retrieval_attempts", 0) == 0 or not (rag_state.get("answer_grounded") or rag_state.get("query_type") == "simple"):
         return
 
-    # STEP 1: Broad Vector Search (Relaxed to 65% to catch acronyms and rewrites)
+    # STEP 1: Broad Vector Search
     results = tracker_cache.similarity_search_with_score(query, k=1)
     
     q_hash = None
@@ -99,7 +139,6 @@ async def track_and_promote(query: str, answer: str, rag_state: dict):
                 
                 if judge_result.is_same:
                     q_hash = results[0][0].metadata.get("tracking_id")
-                    print(f"  -> [TRACKER HIT] LLM verified equivalence with: '{closest_q}'")
                 else:
                     print(f"  -> [TRACKER MISS] LLM rejected equivalence with: '{closest_q}'")
             except Exception as e:
@@ -124,4 +163,4 @@ async def track_and_promote(query: str, answer: str, rag_state: dict):
     
     if new_count == PROMOTION_THRESHOLD:
         save_to_semantic_cache(query, answer)
-        print("  -> [CACHE PROMOTED] Pushed to Chroma and Eval Pipeline.")
+        print("  -> [CACHE PROMOTED] Entry secured with 20-day TTL.")

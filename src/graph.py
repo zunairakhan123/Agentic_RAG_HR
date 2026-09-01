@@ -62,6 +62,7 @@ async def agent_node(state: SupervisorState):
                 "2. If the tool snippet does not contain the exact name or answer, DO NOT guess or use your internal knowledge. "
                 "3. We are Nextbridge Pvt. Ltd. (a software/IT company). Ignore any search results about oil, hydrocarbons, or global conglomerates. "
                 "4. Once search results are returned, answer immediately and DO NOT call the tool again."
+                "5. Don't use your inner knowledge or hallucinate. Only use the tool's output."
             )
             
     # [PRODUCTION FIX]: Stop Tool Shortcut Hallucination
