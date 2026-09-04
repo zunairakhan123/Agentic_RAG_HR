@@ -10,7 +10,11 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 from src.state import SupervisorState, RAGState
 from langchain_groq import ChatGroq
-from src.retrievers import get_simple_retriever, get_complex_retriever
+#from src.retrievers import get_simple_retriever, get_complex_retriever
+from src.retrievers import get_retriever
+import asyncio
+import httpx
+from tenacity import retry, wait_exponential_jitter, stop_after_attempt, retry_if_exception_type
 
 load_dotenv()
 
@@ -32,6 +36,17 @@ primary_llm = ChatOpenAI(
     model="qwen3:30b",
     temperature=0.1
 )
+
+# Tenacity resilience wrapper specifically for Cloudflare tunnel / OpenAI client network drops
+@retry(
+    wait=wait_exponential_jitter(initial=2, max=15),
+    stop=stop_after_attempt(4),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError, Exception)),
+    reraise=True
+)
+async def _robust_generate_call(llm_client, messages):
+    """Async wrapper enforcing backoff and jitter on tunnel requests."""
+    return await llm_client.ainvoke(messages)
 
 # ==========================================
 # Pydantic Schemas 
@@ -171,24 +186,73 @@ async def rag_router_node(state: RAGState) -> dict:
         print("[RAG ROUTER] Warning: Parsing failed. Defaulting to 'COMPLEX'.")
         return {"query_type": "complex", "intent_key": "unknown_complex"}
 
+# async def retrieval_node(state: RAGState) -> dict:
+#     """Uses the RAG query_type to pick the retriever and accumulates documents."""
+#     active_query = state.get("rewritten_query") or state.get("query")
+#     query_type = state.get("query_type", "complex") # Set by rag_router_node
+#     current_attempts = state.get("retrieval_attempts", 0) + 1
+    
+#     print(f"\n[RETRIEVAL NODE] Attempt #{current_attempts} | Mode: {query_type.upper()}")
+#     print(f"[RETRIEVAL NODE] Active Query: '{active_query}'")
+    
+#     try:
+#         if query_type == "simple" and current_attempts == 1:
+#             retriever = get_simple_retriever()
+#         else:
+#             retriever = get_complex_retriever()
+            
+#         new_docs = retriever.invoke(active_query)
+        
+#         # [PRODUCTION FIX]: Accumulate and deduplicate across retry/rewrite loops
+#         existing_docs = state.get("documents", []) or []
+#         seen_contents = {doc.page_content for doc in existing_docs}
+        
+#         combined_docs = list(existing_docs)
+#         for doc in new_docs:
+#             if doc.page_content not in seen_contents:
+#                 seen_contents.add(doc.page_content)
+#                 combined_docs.append(doc)
+
+#         print(f"[RETRIEVAL NODE] Total accumulated unique documents in state: {len(combined_docs)}")
+        
+#         # Print a short snippet of up to 3 docs for terminal clarity
+#         for i, doc in enumerate(combined_docs[:3], 1):
+#             source = doc.metadata.get('source', 'unknown')
+#             snippet = doc.page_content.replace('\n', ' ')[:75]
+#             print(f"  Doc {i} [{source}]: {snippet}...")
+            
+#         return {"documents": combined_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
+#     except Exception as e:
+#         print(f"[RETRIEVAL NODE] Error during retrieval: {e}")
+#         # Return existing docs so we don't lose them on a crash!
+#         existing_docs = state.get("documents", []) or []
+#         return {"documents": existing_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
+
 async def retrieval_node(state: RAGState) -> dict:
-    """Uses the RAG query_type to pick the retriever and accumulates documents."""
+    """Uses the RAG query_type or custom strategy to retrieve and accumulate documents."""
     active_query = state.get("rewritten_query") or state.get("query")
-    query_type = state.get("query_type", "complex") # Set by rag_router_node
+    query_type = state.get("query_type", "complex")
     current_attempts = state.get("retrieval_attempts", 0) + 1
     
-    print(f"\n[RETRIEVAL NODE] Attempt #{current_attempts} | Mode: {query_type.upper()}")
+    # STRICT MODE: Only override if the UI/API payload explicitly sends a strategy
+    custom_strategy = state.get("retriever_strategy")
+    if custom_strategy:
+        strategy_to_run = custom_strategy
+    elif query_type == "simple" and current_attempts == 1:
+        strategy_to_run = "hybrid_rerank"  # Fast-path for simple queries
+    else:
+        strategy_to_run = "main_parent_doc"           # Full multi-sub-query map-reduce
+        
+    print(f"\n[RETRIEVAL NODE] Attempt #{current_attempts} | Mode: {query_type.upper()} | Strategy: '{strategy_to_run}'")
     print(f"[RETRIEVAL NODE] Active Query: '{active_query}'")
     
     try:
-        if query_type == "simple" and current_attempts == 1:
-            retriever = get_simple_retriever()
-        else:
-            retriever = get_complex_retriever()
-            
-        new_docs = retriever.invoke(active_query)
+        retriever = get_retriever(strategy_to_run)
         
-        # [PRODUCTION FIX]: Accumulate and deduplicate across retry/rewrite loops
+        # Run in thread pool to prevent blocking FastAPI's async event loop
+        new_docs = await asyncio.to_thread(retriever.invoke, active_query)
+        
+        # Accumulate and deduplicate across retry/rewrite loops
         existing_docs = state.get("documents", []) or []
         seen_contents = {doc.page_content for doc in existing_docs}
         
@@ -200,19 +264,19 @@ async def retrieval_node(state: RAGState) -> dict:
 
         print(f"[RETRIEVAL NODE] Total accumulated unique documents in state: {len(combined_docs)}")
         
-        # Print a short snippet of up to 3 docs for terminal clarity
-        for i, doc in enumerate(combined_docs[:3], 1):
-            source = doc.metadata.get('source', 'unknown')
-            snippet = doc.page_content.replace('\n', ' ')[:75]
-            print(f"  Doc {i} [{source}]: {snippet}...")
-            
-        return {"documents": combined_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": None}
+        return {
+            "documents": combined_docs, 
+            "retrieval_attempts": current_attempts, 
+            "retrieval_failure_reason": None
+        }
     except Exception as e:
         print(f"[RETRIEVAL NODE] Error during retrieval: {e}")
-        # Return existing docs so we don't lose them on a crash!
         existing_docs = state.get("documents", []) or []
-        return {"documents": existing_docs, "retrieval_attempts": current_attempts, "retrieval_failure_reason": str(e)}
-
+        return {
+            "documents": existing_docs, 
+            "retrieval_attempts": current_attempts, 
+            "retrieval_failure_reason": str(e)
+        }
     
 async def document_grader_node(state: RAGState) -> dict:
     active_query = state.get("rewritten_query") or state.get("query")
@@ -274,17 +338,54 @@ Rewrite the query to be highly optimized for a vector database. Focus specifical
         return {"rewritten_query": original_query, "correction_reason": "Fallback."}
 
 
+# async def generation_node(state: RAGState) -> dict:
+#     user_query = state.get("query") 
+#     docs = state.get("documents", [])
+#     context = "\n\n".join([f"--- Source Excerpt {i+1} ---\n{doc.page_content}" for i, doc in enumerate(docs)])
+    
+#     attempt = state.get("generation_attempts", 0) + 1
+#     print(f"\n[GENERATION NODE] Synthesizing response (Attempt #{attempt})...")
+    
+#     # [FIXED PROMPT]: Forcing systematic breakdown for multi-questions
+#     prompt = f"""You are the official NextBridge HR AI Assistant. 
+# Answer the user's question accurately using ONLY the provided HR documents.
+
+# User Question: "{user_query}"
+
+# HR Documents:
+# {context}
+
+# CRITICAL GENERATION RULES:
+# 1. If the user asks multiple distinct questions, you MUST address EACH question separately using clear bullet points or headers.
+# 2. If the provided documents do not contain information for a specific part of the query, explicitly state: "The documents do not specify [topic]."
+# 3. DO NOT narrate your internal process (e.g. "Based on the documents provided..."). Speak directly to the user.
+# 4. If the extracted information contains tabular data, limits, or form fields, you MUST format the output using proper Markdown tables or structured lists to preserve readability.
+
+# Answer:"""
+    
+#     response = await primary_llm.ainvoke([HumanMessage(content=prompt)])
+#     print("[GENERATION NODE] Generation complete.")
+#     return {"generation": response.content, "generation_attempts": attempt}
+
+
 async def generation_node(state: RAGState) -> dict:
     user_query = state.get("query") 
     docs = state.get("documents", [])
-    context = "\n\n".join([f"--- Source Excerpt {i+1} ---\n{doc.page_content}" for i, doc in enumerate(docs)])
+    
+    # Context window guardrail: Cap the length of each document slice to avoid payload limits
+    context_blocks = []
+    for i, doc in enumerate(docs[:6]): # Bound to max 6 docs to prevent massive payload size over tunnel
+        content = doc.page_content.strip()[:1500] # Safe character truncate per doc
+        src = doc.metadata.get("source_file", "unknown")
+        context_blocks.append(f"--- Source Excerpt {i+1} ({src}) ---\n{content}")
+    
+    context = "\n\n".join(context_blocks)
     
     attempt = state.get("generation_attempts", 0) + 1
-    print(f"\n[GENERATION NODE] Synthesizing response (Attempt #{attempt})...")
+    print(f"\n[GENERATION NODE] Synthesizing response via Cloudflare Tunnel (Attempt #{attempt})...")
     
-    # [FIXED PROMPT]: Forcing systematic breakdown for multi-questions
     prompt = f"""You are the official NextBridge HR AI Assistant. 
-Answer the user's question accurately using ONLY the provided HR documents.
+You are given multiple document excerpts below which may contain answers to different parts of the user's compound or multi-part question. Read ALL excerpts carefully and synthesize a complete response.
 
 User Question: "{user_query}"
 
@@ -292,16 +393,26 @@ HR Documents:
 {context}
 
 CRITICAL GENERATION RULES:
-1. If the user asks multiple distinct questions, you MUST address EACH question separately using clear bullet points or headers.
-2. If the provided documents do not contain information for a specific part of the query, explicitly state: "The documents do not specify [topic]."
-3. DO NOT narrate your internal process (e.g. "Based on the documents provided..."). Speak directly to the user.
-4. If the extracted information contains tabular data, limits, or form fields, you MUST format the output using proper Markdown tables or structured lists to preserve readability.
+1. Systematically scan ALL provided excerpts to address every distinct part or question asked by the user.
+2. Do NOT claim information is missing until you have checked every single excerpt.
+3. If a specific detail is genuinely absent from all provided documents, explicitly state: "The documents do not specify [topic]."
+4. DO NOT narrate your internal process (e.g. "Based on the documents provided..."). Speak directly to the user.
+5. If the extracted information contains tabular data, limits, or form fields, you MUST format the output using proper Markdown tables or structured lists to preserve readability.
+
 
 Answer:"""
     
-    response = await primary_llm.ainvoke([HumanMessage(content=prompt)])
-    print("[GENERATION NODE] Generation complete.")
-    return {"generation": response.content, "generation_attempts": attempt}
+    try:
+        response = await _robust_generate_call(primary_llm, [HumanMessage(content=prompt)])
+        print("[GENERATION NODE] Generation complete.")
+        return {"generation": response.content, "generation_attempts": attempt}
+    except Exception as e:
+        print(f"\n❌ [GENERATION NODE ERROR] Tunnel connection permanently failed after retries: {e}")
+        fallback_msg = (
+            "I encountered a temporary network constraint while querying the local policy server. "
+            "The document payload was too large or the tunnel dropped. Please try re-sending your query."
+        )
+        return {"generation": fallback_msg, "generation_attempts": attempt}
 
 async def reflection_node(state: RAGState) -> dict:
     user_query = state.get("query") 
@@ -317,17 +428,25 @@ Answer: "{generation}"
 Context:\n{context}
 
 RULES:
-1. If supported, is_grounded=True, error_type="none".
-2. If facts missing from context, is_grounded=False.
-3. If False: "missing_evidence" (context lacks facts) or "wording_problem" (answer brought outside knowledge).
+1. If all facts, numbers, and policies in the answer are supported by the context, set is_grounded=True and error_type="none".
+2. Leniency Clause: Minor semantic paraphrasing, natural structuring, or standard recurring temporal inferences (like treating a manual correction limit as recurring or monthly) do NOT constitute a wording problem as long as core factual numbers and policies match the text.
+3. If core facts or data are entirely absent from the context, set is_grounded=False and error_type="missing_evidence" (this will trigger a re-search).
+4. If the answer explicitly contradicts the text or introduces fabricated numbers/outside rules, set is_grounded=False and error_type="wording_problem" (this will regenerate the response using current context).
 """
-    # USE PRIMARY LLM (Needs advanced reasoning to detect complex hallucinations)
     structured_llm = primary_llm.with_structured_output(ReflectionResult)
     try:
         result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
         status = "GROUNDED" if result.is_grounded else f"UNGROUNDED ({result.error_type})"
         print(f"[REFLECTION NODE] Result: {status} | Reason: {result.reason}")
-        return {"answer_grounded": result.is_grounded, "reflection_error_type": result.error_type, "reflection_reason": result.reason}
+        return {
+            "answer_grounded": result.is_grounded, 
+            "reflection_error_type": result.error_type, 
+            "reflection_reason": result.reason
+        }
     except Exception as e:
         print(f"[REFLECTION NODE] Warning: Parsing failed. Assumed GROUNDED. Error: {e}")
-        return {"answer_grounded": True, "reflection_error_type": "none", "reflection_reason": str(e)}
+        return {
+            "answer_grounded": True, 
+            "reflection_error_type": "none", 
+            "reflection_reason": str(e)
+        }

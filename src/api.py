@@ -19,8 +19,13 @@ import uvicorn
 import sys
 import asyncio
 import warnings
+from typing import Optional
 # Suppress harmless Pydantic V2 serialization warnings from LangChain structured outputs
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+import os
+
+os.environ["LANGCHAIN_PROJECT"] = "nextbridge-hr-agent-production"
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
 
 hr_graph = None
 _memory_context = None
@@ -57,6 +62,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     thread_id: str
     message: str
+    retriever_strategy: Optional[str] = None  # <--- Expose to payload
 
 class EmailApprovalRequest(BaseModel):
     thread_id: str
@@ -67,20 +73,104 @@ class DepartmentReplyWebhook(BaseModel):
     department: str
     reply_body: str
 
-async def event_generator(thread_id: str, message: str):
+# async def event_generator(thread_id: str, message: str ,retriever_strategy: str = None):
+#     config = {"configurable": {"thread_id": thread_id}}
+#     full_response = "" 
+
+#     # Inject strategy into the initial graph state
+#     initial_state = {
+#         "messages": [HumanMessage(content=message)],
+#         "retriever_strategy": retriever_strategy
+#     }
+#     async for event in hr_graph.astream_events(
+#         initial_state,
+#         config=config,
+#         version="v2",
+#     ):
+#         kind = event["event"]
+#         # Determine exactly which node generated this event
+#         node_name = event.get("metadata", {}).get("langgraph_node", "")
+
+#         # 1. Stream ONLY the actual user-facing LLM nodes (hides internal JSON)
+#         if kind == "on_chat_model_stream" and node_name in ["generation", "agent"]:
+#             chunk = event["data"]["chunk"]
+#             content = chunk.content if hasattr(chunk, "content") else chunk
+#             if isinstance(content, list) and len(content) > 0:
+#                 content = content[0].get("text", "")
+#             if content:
+#                 full_response += content 
+#                 yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+#         # Only clear the UI on the VERY FIRST generation attempt, not during background self-correction loops
+#         elif kind == "on_chat_model_start" and node_name == "generation":
+#             # Check event metadata or state to ensure it's attempt #1
+#             attempt_count = event.get("data", {}).get("input", {}).get("generation_attempts", 0)
+#             if attempt_count <= 1:
+#                 yield f"data: {json.dumps({'type': 'clear'})}\n\n"
+
+#         # 1b. Catch the Guardrail rejection and stream the polite message
+#         elif kind == "on_chain_end" and node_name == "guardrail":
+#             output = event["data"].get("output", {})
+#             if isinstance(output, dict) and output.get("final_status") == "guardrail_blocked":
+#                 msg = output["messages"][0].content
+#                 full_response += msg
+#                 yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
+
+#         # 2. Stream ReAct Tool executions
+#         elif kind == "on_tool_start":
+#             tool_name = event["name"]
+#             tool_inputs = event["data"].get("input")
+#             yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name, 'input': tool_inputs})}\n\n"
+
+#         elif kind == "on_tool_end":
+#             output = event["data"].get("output")
+#             yield f"data: {json.dumps({'type': 'tool_end', 'output': str(output)})}\n\n"
+            
+#         # 3. Stream Node Transitions for UI Status
+#         elif kind == "on_chain_start":
+#             tracked_nodes = [
+#                 "guardrail", "router", "rag_wrapper", "agent", 
+#                 "rag_router", "retrieve", "grader", "rewrite", "reflection"
+#             ]
+#             if node_name in tracked_nodes:
+#                 # Map internal names to professional UI labels
+#                 pretty_names = {
+#                     "guardrail": "Input Guardrail",
+#                     "router": "Supervisor Routing",
+#                     "rag_wrapper": "Initializing RAG",
+#                     "agent": "ReAct Agent",
+#                     "rag_router": "Analyzing Complexity",
+#                     "retrieve": "Retrieving Documents",
+#                     "grader": "Grading Context",
+#                     "rewrite": "Optimizing Query",
+#                     "reflection": "Validating Answer"
+#                 }
+#                 display_name = pretty_names.get(node_name, node_name)
+#                 status_msg = f"Executing {display_name}..."
+#                 yield f"data: {json.dumps({'type': 'status', 'content': status_msg})}\n\n"
+
+#     # [FIX]: Removed the old save_to_semantic_cache() block!
+#     # Caching is now handled entirely in the background by track_and_promote.
+#     yield "data: [DONE]\n\n"
+
+async def event_generator(thread_id: str, message: str, retriever_strategy: str = None):
     config = {"configurable": {"thread_id": thread_id}}
     full_response = "" 
+    ui_cleared = False  # <--- Local flag to ensure single-wipe per request
 
+    # Inject strategy into the initial graph state
+    initial_state = {
+        "messages": [HumanMessage(content=message)],
+        "retriever_strategy": retriever_strategy
+    }
     async for event in hr_graph.astream_events(
-        {"messages": [HumanMessage(content=message)]},
+        initial_state,
         config=config,
         version="v2",
     ):
         kind = event["event"]
-        # Determine exactly which node generated this event
         node_name = event.get("metadata", {}).get("langgraph_node", "")
 
-        # 1. Stream ONLY the actual user-facing LLM nodes (hides internal JSON)
+        # 1. Stream ONLY actual user-facing LLM nodes
         if kind == "on_chat_model_stream" and node_name in ["generation", "agent"]:
             chunk = event["data"]["chunk"]
             content = chunk.content if hasattr(chunk, "content") else chunk
@@ -89,11 +179,14 @@ async def event_generator(thread_id: str, message: str):
             if content:
                 full_response += content 
                 yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
-        # [NEW FIX]: Trigger UI wipe when Self-RAG starts a new draft
-        elif kind == "on_chat_model_start" and node_name == "generation":
-            yield f"data: {json.dumps({'type': 'clear'})}\n\n"
 
-        # 1b. Catch the Guardrail rejection and stream the polite message
+        # Clear UI exactly once on the very first start of the generation node
+        elif kind == "on_chat_model_start" and node_name == "generation":
+            if not ui_cleared:
+                yield f"data: {json.dumps({'type': 'clear'})}\n\n"
+                ui_cleared = True
+
+        # 1b. Catch Guardrail rejection
         elif kind == "on_chain_end" and node_name == "guardrail":
             output = event["data"].get("output", {})
             if isinstance(output, dict) and output.get("final_status") == "guardrail_blocked":
@@ -118,7 +211,6 @@ async def event_generator(thread_id: str, message: str):
                 "rag_router", "retrieve", "grader", "rewrite", "reflection"
             ]
             if node_name in tracked_nodes:
-                # Map internal names to professional UI labels
                 pretty_names = {
                     "guardrail": "Input Guardrail",
                     "router": "Supervisor Routing",
@@ -134,8 +226,6 @@ async def event_generator(thread_id: str, message: str):
                 status_msg = f"Executing {display_name}..."
                 yield f"data: {json.dumps({'type': 'status', 'content': status_msg})}\n\n"
 
-    # [FIX]: Removed the old save_to_semantic_cache() block!
-    # Caching is now handled entirely in the background by track_and_promote.
     yield "data: [DONE]\n\n"
 
 # In-memory queue to hold proactive agent messages for the frontend
@@ -173,7 +263,7 @@ async def chat_endpoint(request: ChatRequest):
     
     # 2. If no cache, run the LangGraph event generator
     return StreamingResponse(
-        event_generator(request.thread_id, request.message),
+        event_generator(request.thread_id, request.message, request.retriever_strategy),
         media_type="text/event-stream",
     )
 

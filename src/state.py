@@ -26,6 +26,7 @@ class SupervisorState(TypedDict):
     query_type: Optional[str]  # e.g., "simple", "complex", "email", "chat"
     final_status: Optional[str] # e.g., "success", "guardrail_blocked"
 
+    retriever_strategy: Optional[str]
 
 # =========================================================
 # 2. Child Graph State (CRAG Subgraph)
@@ -41,6 +42,7 @@ class RAGState(TypedDict):
     # Retrieval State
     documents: List[Document]
     retrieval_attempts: int
+    retriever_strategy: Optional[str]
     retrieval_failure_reason: Optional[str]
     # [FIX] Use a dedicated string to overwrite drafts, NOT a list!
     final_generation: str

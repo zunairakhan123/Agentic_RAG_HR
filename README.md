@@ -33,16 +33,18 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
 
 ---
 
-##  Architectural Highlights
+## Architectural Highlights
 
-- **Hierarchical State Orchestration:** Decouples lightweight conversational routing from compute-heavy CRAG loops, eliminating tool hallucination and non-deterministic routing traps.
-- **Resilient Self-Correction:** Evaluates retrieved chunk relevance with a structured grader, rewrites poor retrieval queries, and self-checks generated responses against context using an output reflection guardrail.
-- **Zero-Trust Tool Sandboxing:** Strips write/dispatch capabilities (`send_department_email`) from the agent's runtime execution environment until strict Human-in-the-Loop verification conditions are satisfied.
-- **Programmatic Entity Guarding:** Enforces deterministic query transformations at the tool level to prevent external entity collisions across similarly named corporate entities.
-- **Smooth UI Invalidation Protocol:** Emits granular Server-Sent Events (`clear`, `token`, `status`, `tool_start`, `tool_end`) to deliver real-time token streaming and transparent reflection wipes without client-side text-stacking glitches.
-- **Map-Reduce Sub-Query Retrieval:** Decomposes complex, multi-intent questions into isolated parallel vector searches and localized cross-encoder re-ranking. This completely eliminates keyword starvation, cross-encoder penalties, and LLM "generator amnesia" on compound queries.
-- **LLM-Evaluated Semantic Caching:** Replaces naive string hashing with a two-tier Cosine Similarity and LLM-as-a-Judge caching system. Accurately merges acronyms and rephrasings (e.g., "OPD" vs "Outpatient") for tracking, while maintaining strict 90% semantic thresholds for instant cache delivery.
-
+- **Hierarchical State Orchestration**: Decouples lightweight conversational routing from compute-heavy CRAG loops, eliminating tool hallucination and non-deterministic routing traps.
+- **Resilient Self-Correction**: Evaluates retrieved chunk relevance with a structured grader, rewrites poor retrieval queries, and self-checks generated responses against context using an output reflection guardrail with semantic leniency.
+- **Zero-Trust Tool Sandboxing**: Strips write/dispatch capabilities (send_department_email) from the agent's runtime execution environment until strict Human-in-the-Loop verification conditions are satisfied.
+- **Programmatic Entity Guarding**: Enforces deterministic query transformations at the tool level to prevent external entity collisions across similarly named corporate entities.
+- **Smooth UI Invalidation Protocol**: Emits granular Server-Sent Events (clear, token, status, tool_start, tool_end) to deliver real-time token streaming and transparent single-wipe initialization without client-side text-stacking glitches.
+- **Fair-Share Map-Reduce Retrieval**: Decomposes complex, multi-intent questions into isolated parallel vector searches with per-sub-query fair-share chunk distribution (up to 2 chunks per branch) and context capping (6 pages max). This eliminates keyword starvation, cross-encoder penalties, and LLM context exhaustion on compound queries.
+- **LLM-Evaluated Semantic Caching**: Replaces naive string hashing with a two-tier Cosine Similarity and LLM-as-a-Judge caching system. Accurately merges acronyms and rephrasings (e.g., "OPD" vs "Outpatient") for tracking, while maintaining strict 90% semantic thresholds for instant cache delivery.
+- **Retrievers & Aliasing**: Integrated a full suite of modular retrieval strategies into RETRIEVER_REGISTRY (dense, hybrid, hybrid_rerank, main[multi_sub,hybridrerank], main_self_query, main_parent_doc, champion, main_multi_query, main_rag_fusion, main_hyde), with "champion" aliased directly to MainParentDocumentRetriever.
+- **Adaptive Routing & Strategy Switch**: Configured the rag_router_node and retrieval_node to dynamically switch strategies based on query complexity—routing simple, direct queries to the low-latency hybrid_rerank strategy and complex, multi-part, or comparative inquiries to the main_parent_doc (Champion Map-Reduce) architecture, while supporting manual API payload overrides.
+- **Fair-Share Allocation & Budget Capping**: Upgraded MainMapReduceRetriever with independent per-sub-query chunk retrieval (compressed[:2] fair-share distribution across sub-query branches) and strict parent hydration limits (capped at 6 high-density pages max) to completely eliminate keyword starvation and context window fatigue.
 
 ---
 
@@ -78,6 +80,8 @@ A production-grade, event-driven Agentic AI microservice that orchestrates corpo
 │ (Dynamic Tool Sandboxed)│   │                                  └───────────┬─────────────┘
 └───────────┬─────────────┘   │                                              │
             │                 │                                              ▼
+            |                 |                                           RAG ROUTER
+            |                 |                                              ▼
             ├───────────────┐ │                                  ┌─────────────────────────┐
             ▼               ▼ │                         ┌───────►│   Adaptive Retrieval    │
   ┌──────────────────┐ ┌──────────────────┐             │        └───────────┬─────────────┘

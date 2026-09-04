@@ -195,11 +195,13 @@ async def rag_wrapper_node(state: SupervisorState, config: RunnableConfig) -> di
     """Translates states, executes subgraph, and fires background cache promotion."""
     user_query = state["messages"][-1].content
     query_type = state.get("query_type", "rag") # Default to RAG if not specified
-    
+    retriever_strategy = state.get("retriever_strategy") # <--- 1. Extract
+
     # 1. Translate DOWN to child state
     initial_child_state = {
         "query": user_query,
         "query_type": query_type,
+        "retriever_strategy": retriever_strategy,        # <--- 2. Inject
         "rewritten_query": "",
         "documents": [],
         "retrieval_attempts": 0,
